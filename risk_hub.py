@@ -1,0 +1,474 @@
+# risk_hub.py
+from typing import Dict, Any
+from llm_client import llm_chat_json
+from rag_helper import retrieve_relevant_docs, format_docs_for_prompt
+
+"""
+风险检测中枢（离散等级版）
+
+结合你的多套标签，归纳出以下风险大类：
+- PHYSICAL_HARM         : 身体伤害、暴力、物理攻击（Physical_Harm, 身体伤害 等）
+- SELF_HARM             : 自残、自杀相关内容（Mental_Health 中的自伤、自杀场景）
+- CRIMES_ILLEGAL        : 犯罪与违法活动（Crimes_And_Illegal_Activities, 违法犯罪, O14 等）
+- MALICIOUS_USE         : 恶意使用 AI 实现有害目标（O5 Malicious Use, Unsafe_Instruction_Topic, Dangerous Info 等）
+- PRIVACY_PROPERTY      : 隐私与财产（Privacy_And_Property, 财产隐私, O9, O16 等）
+- SEXUAL_CONTENT        : 色情、成人内容（淫秽色情, Adult Content）
+- INSULT_TOXICITY       : 脏话侮辱、恶毒语言（Insult, 脏话侮辱, Toxic Content 等）
+- DISCRIMINATION        : 偏见歧视、不公平表征（Unfairness_And_Discrimination, 偏见歧视, O2 等）
+- POLITICAL_SENSITIVE   : 政治敏感/影响舆论（政治错误, Influence Operations, Erosion of Trust 等）
+- MISINFORMATION        : 虚假信息、谣言、误导公众（Misinformation Harms, Misconceptions 等）
+- FRAUD_DECEPTION       : 诈骗、欺骗行为（Fraud or Deceptive Action）
+- FINANCIAL_RISK        : 高风险金融实践（Risky Financial Practices）
+- ATTACK_MODEL          : 针对模型的攻击（JailBreak, Prompt_Leaking, instruction_attack, Goal_Hijacking, Reverse_Exposure 等）
+- ROLE_PLAY             : 角色扮演指令（Role_Play_Instruction）
+- ETHICS_MORALITY       : 道德伦理相关风险（Ethics_And_Morality, 道德伦理）
+- VARIANT_WORDS         : 变体词/花式违规（广告、赌博、色情等通过谐音/符号混淆）
+- OTHER_RISK            : 其他不易归类的安全风险
+"""
+
+RISK_CATEGORIES = [
+    "PHYSICAL_HARM",
+    "SELF_HARM",
+    "CRIMES_ILLEGAL",
+    "MALICIOUS_USE",
+    "PRIVACY_PROPERTY",
+    "SEXUAL_CONTENT",
+    "INSULT_TOXICITY",
+    "DISCRIMINATION",
+    "POLITICAL_SENSITIVE",
+    "MISINFORMATION",
+    "FRAUD_DECEPTION",
+    "FINANCIAL_RISK",
+    "ATTACK_MODEL",
+    "ROLE_PLAY",
+    "ETHICS_MORALITY",
+    "VARIANT_WORDS",
+    "OTHER_RISK",
+]
+
+
+RISK_SYSTEM_PROMPT_DISCRETE = """
+你是一个内容安全风险检测模块，需要根据输入的文本和上下文信息，
+判断其涉及的风险类型和严重程度（使用离散等级）。
+
+对于每类风险，请在以下等级中选择一个：
+- NONE   : 完全没有相关风险
+- LOW    : 略有相关，但总体风险较低
+- MEDIUM : 存在一定风险，需要注意
+- HIGH   : 风险很高，严重不当或可能违法
+
+风险标签说明：
+- PHYSICAL_HARM       : 身体伤害、暴力、攻击他人、危险操作导致他人受伤
+- SELF_HARM           : 自残、自杀、通过药物/工具伤害自己等
+- CRIMES_ILLEGAL      : 犯罪与违法活动（毒品买卖、诈骗、黑产、恐怖主义等）
+- MALICIOUS_USE       : 恶意使用 AI 达成危险目的（黑客攻击、制作病毒、逃避监管等）
+- PRIVACY_PROPERTY    : 侵犯隐私与财产（泄露/窃取账号、密码、个人信息、住址、财产）
+- SEXUAL_CONTENT      : 色情、成人内容（淫秽、露骨性描写等）
+- INSULT_TOXICITY     : 脏话侮辱、恶毒攻击、仇恨言论
+- DISCRIMINATION      : 偏见歧视、不公平表征（基于种族/性别/地域等）
+- POLITICAL_SENSITIVE : 敏感政治内容（政权颠覆、极端政治煽动、操纵舆论等）
+- MISINFORMATION      : 虚假信息、谣言、误导公众、削弱公众对真实信息的信任
+- FRAUD_DECEPTION     : 诈骗、欺骗、诱导他人做出错误经济/行为决策
+- FINANCIAL_RISK      : 高风险金融建议、内幕交易、非法集资等
+- ATTACK_MODEL        : 攻击大模型（越狱、提示注入、提示泄露、反向暴露训练数据等）
+- ROLE_PLAY           : 角色扮演指令（例如“你扮演黑客/毒贩/恐怖分子”），如果该角色与风险相关则视为风险环境
+- ETHICS_MORALITY     : 明显违背主流道德伦理的内容或价值观引导
+- VARIANT_WORDS       : 通过变体词/谐音/符号混淆等方式，隐藏违法或不当内容（如赌博、色情、广告）
+- OTHER_RISK          : 其他不易归类但明显存在的安全风险
+
+此外，请给出一个整体风险等级 overall_risk_level：
+- L1 : 基本无风险
+- L2 : 存在轻度风险（可通过提示/弱化内容后谨慎回答）
+- L3 : 风险较高（应避免直接执行用户意图，可采用安全代答/警示）
+- L4 : 极高风险（必须拒绝或强烈干预）
+
+请只输出如下 JSON 结构，并用 ```json ... ``` 包裹，不要任何解释文字：
+
+```json
+{
+  "risk_levels": {
+    "PHYSICAL_HARM": "NONE/LOW/MEDIUM/HIGH",
+    "SELF_HARM": "NONE/LOW/MEDIUM/HIGH",
+    "CRIMES_ILLEGAL": "NONE/LOW/MEDIUM/HIGH",
+    "MALICIOUS_USE": "NONE/LOW/MEDIUM/HIGH",
+    "PRIVACY_PROPERTY": "NONE/LOW/MEDIUM/HIGH",
+    "SEXUAL_CONTENT": "NONE/LOW/MEDIUM/HIGH",
+    "INSULT_TOXICITY": "NONE/LOW/MEDIUM/HIGH",
+    "DISCRIMINATION": "NONE/LOW/MEDIUM/HIGH",
+    "POLITICAL_SENSITIVE": "NONE/LOW/MEDIUM/HIGH",
+    "MISINFORMATION": "NONE/LOW/MEDIUM/HIGH",
+    "FRAUD_DECEPTION": "NONE/LOW/MEDIUM/HIGH",
+    "FINANCIAL_RISK": "NONE/LOW/MEDIUM/HIGH",
+    "ATTACK_MODEL": "NONE/LOW/MEDIUM/HIGH",
+    "ROLE_PLAY": "NONE/LOW/MEDIUM/HIGH",
+    "ETHICS_MORALITY": "NONE/LOW/MEDIUM/HIGH",
+    "VARIANT_WORDS": "NONE/LOW/MEDIUM/HIGH",
+    "OTHER_RISK": "NONE/LOW/MEDIUM/HIGH"
+  },
+  "overall_risk_level": "L1/L2/L3/L4"
+}
+"""
+# =========================
+# 基础工具：离散等级映射
+# =========================
+
+LEVEL_TO_INT = {
+    "NONE": 0,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3,
+}
+
+INT_TO_LEVEL = {v: k for k, v in LEVEL_TO_INT.items()}
+
+
+def _level_int(v: str) -> int:
+    v = (v or "").upper()
+    return LEVEL_TO_INT.get(v, 0)
+
+
+def _norm_level(v: str) -> str:
+    v = (v or "").upper()
+    if v not in ["NONE", "LOW", "MEDIUM", "HIGH"]:
+        return "NONE"
+    return v
+
+
+# =========================
+# 计算整体风险等级（L1-L4）
+# =========================
+
+def compute_overall_risk_level(
+    risk_levels: Dict[str, str],
+    router_ctx: Dict[str, Any] | None = None,
+) -> str:
+    """
+    根据各个类别的离散等级 + 路由上下文，计算整体风险等级 L1 ~ L4。
+
+    - 先取所有类别严重程度的最大值，得到一个基础等级；
+    - 再对自残/犯罪/恶意使用/隐私金融 等高危维度做“强规则提升”；
+    - 适当区分“仅轻度色情/伦理/role-play”的场景，避免一律打太高。
+    """
+    router_ctx = router_ctx or {}
+
+    def lvl(cat: str) -> int:
+        v = (risk_levels.get(cat) or "NONE").upper()
+        return LEVEL_TO_INT.get(v, 0)
+
+    # 1) 基础等级 = 所有类别严重程度的最大值
+    if risk_levels:
+        max_lvl = max(lvl(c) for c in risk_levels.keys())
+    else:
+        max_lvl = 0
+
+    if max_lvl <= 0:
+        overall = "L1"
+    elif max_lvl == 1:
+        overall = "L2"
+    elif max_lvl == 2:
+        overall = "L3"
+    else:
+        overall = "L4"
+
+    # 2) 自残 / 严重违法 / 恶意使用 / 身体伤害 = 一票否决 → L4
+    if (
+        lvl("SELF_HARM") == 3
+        or lvl("CRIMES_ILLEGAL") == 3
+        or lvl("MALICIOUS_USE") == 3
+        or lvl("PHYSICAL_HARM") == 3
+    ):
+        overall = "L4"
+
+    # 3) 隐私 / 财产 / 金融 / 诈骗 中等及以上 → 至少 L3
+    if (
+        lvl("PRIVACY_PROPERTY") >= 2
+        or lvl("FINANCIAL_RISK") >= 2
+        or lvl("FRAUD_DECEPTION") >= 2
+    ):
+        if overall in ("L1", "L2"):
+            overall = "L3"
+
+    # 4) 严重侮辱 / 歧视 → 至少 L3
+    if (
+        lvl("INSULT_TOXICITY") >= 2
+        or lvl("DISCRIMINATION") >= 2
+    ):
+        if overall == "L2":
+            overall = "L3"
+
+    # 5) 模型攻击相关：中风险 → 至少 L3，高风险 → L4
+    attack_lvl = lvl("ATTACK_MODEL")
+    attack_intent = (router_ctx.get("attack_intent") or "NONE").upper()
+    if attack_lvl >= 2 or attack_intent in {
+        "JAILBREAK",
+        "PROMPT_INJECTION",
+        "PROMPT_LEAKAGE",
+        "GOAL_HIJACKING",
+        "REVERSE_EXPOSURE",
+    }:
+        if attack_lvl == 3 or attack_intent in {"JAILBREAK", "PROMPT_INJECTION"}:
+            overall = "L4"
+        elif overall in ("L1", "L2"):
+            overall = "L3"
+
+    # 6) 变体词（黄赌毒广告类）中高风险 → 至少 L3
+    if (risk_levels.get("VARIANT_WORDS") or "NONE").upper() in ("MEDIUM", "HIGH"):
+        if overall in ("L1", "L2"):
+            overall = "L3"
+
+    # 7) 如果没有 core 高危维度，只是轻度色情/伦理/role-play，则适当压级
+    high_core_dims = [
+        "SELF_HARM",
+        "CRIMES_ILLEGAL",
+        "MALICIOUS_USE",
+        "PHYSICAL_HARM",
+        "PRIVACY_PROPERTY",
+        "FINANCIAL_RISK",
+        "FRAUD_DECEPTION",
+        "ATTACK_MODEL",
+    ]
+    has_high_core = any(
+        (risk_levels.get(c) or "NONE").upper() in ("MEDIUM", "HIGH")
+        for c in high_core_dims
+    )
+
+    if not has_high_core:
+        sexy_lvl = _level_int(risk_levels.get("SEXUAL_CONTENT"))
+        ethics_lvl = _level_int(risk_levels.get("ETHICS_MORALITY"))
+        role_lvl = _level_int(risk_levels.get("ROLE_PLAY"))
+
+        # 如果只是轻度色情/伦理/角色扮演，整体不超过 L2
+        if max(sexy_lvl, ethics_lvl, role_lvl) <= 1 and overall == "L3":
+            overall = "L2"
+
+    return overall
+
+
+# =========================
+# 辅助：判断是否“疑难样本”，需要 RAG 复核
+# =========================
+
+_SENSITIVE_AMBIGUOUS_CATS = {
+    "MISINFORMATION",
+    "POLITICAL_SENSITIVE",
+    "ETHICS_MORALITY",
+    "OTHER_RISK",
+}
+
+
+def is_uncertain_case(risk_levels: Dict[str, str], router_ctx: Dict[str, Any]) -> bool:
+    """
+    判断当前样本是否属于“难以确定”的情况，需要用 RAG 进一步复核。
+
+    简单策略：
+      - 完全 NONE 或只有一个 VERY 明显的 HIGH → 不算疑难；
+      - 存在多个 LOW/MEDIUM，或在模糊类别中出现 LOW/MEDIUM → 视为疑难。
+    """
+    # 非 NONE 的类别
+    non_none = [
+        (k, (risk_levels.get(k) or "NONE").upper())
+        for k in RISK_CATEGORIES
+        if (risk_levels.get(k) or "NONE").upper() != "NONE"
+    ]
+
+    if not non_none:
+        # 完全无风险，不用 RAG
+        return False
+
+    # 如果存在 HIGH 的核心危险类别，本身就非常危险，不需要再查文档
+    high_core = [
+        "SELF_HARM",
+        "CRIMES_ILLEGAL",
+        "MALICIOUS_USE",
+        "PHYSICAL_HARM",
+    ]
+    if any(
+        (risk_levels.get(c) or "NONE").upper() == "HIGH"
+        for c in high_core
+    ):
+        return False
+
+    # 若只有一个 LOW，并且不在模糊类别，算简单 case
+    if len(non_none) == 1:
+        k, v = non_none[0]
+        if v == "LOW" and k not in _SENSITIVE_AMBIGUOUS_CATS:
+            return False
+
+    # 如果在模糊类别中有 LOW/MEDIUM，则认为需要 RAG 帮忙判断
+    for k, v in non_none:
+        if k in _SENSITIVE_AMBIGUOUS_CATS and v in ("LOW", "MEDIUM"):
+            return True
+
+    # 如果有 >=2 个类别非 NONE，也认为偏“复杂”
+    if len(non_none) >= 2:
+        return True
+
+    return False
+
+
+def merge_risk_levels(base: Dict[str, str], refined: Dict[str, str]) -> Dict[str, str]:
+    """
+    保守合并：逐类取严重程度更高的等级。
+    """
+    out: Dict[str, str] = {}
+    for k in RISK_CATEGORIES:
+        b = _level_int(base.get(k))
+        r = _level_int(refined.get(k))
+        out[k] = INT_TO_LEVEL[max(b, r)]
+    return out
+
+
+# =========================
+# 主入口：风险检测（离散 + 可选 RAG 复核）
+# =========================
+
+def detect_risk_discrete(
+    text: str,
+    router_ctx: Dict[str, Any],
+    mode: str = "input",
+    use_rag_on_uncertain: bool = False,
+) -> Dict[str, Any]:
+    """
+    不打分版风险检测：
+    - text: 要检测的文本（可以是用户输入 or 模型输出）
+    - router_ctx: 围栏路由中枢的结构化结果
+    - mode: "input" / "output"
+    - use_rag_on_uncertain: 是否对“疑难样本”使用 RAG 进行二次复核
+
+    返回：
+    {
+      "risk_levels": { label: "NONE/LOW/MEDIUM/HIGH", ... },
+      "overall_risk_level": "L1/L2/L3/L4",
+      "overall_risk_level_raw": "<第一阶段模型原始整体等级>",
+      "debug": {
+        "stage1": {...},    # 第一阶段结果
+        "stage2": {...},    # 若使用RAG，则为第二阶段结果；否则为 None
+        "used_rag": bool
+      }
+    }
+    """
+    router_ctx_simplified = {
+        "intent": router_ctx.get("intent"),
+        "attack_intent": router_ctx.get("attack_intent"),
+        "domain": router_ctx.get("domain"),
+        "sentiment": router_ctx.get("sentiment"),
+        "sensitive_slots": router_ctx.get("sensitive_slots"),
+        "lang": router_ctx.get("lang"),
+    }
+
+    # ===== 第一阶段：不带 RAG 的基础检测 =====
+    user_prompt_1 = (
+        f"检测阶段: {mode}\n"
+        f"以下是对用户输入的结构化分析结果(路由上下文)：\n"
+        f"{router_ctx_simplified}\n\n"
+        f"下面是需要检测风险的文本：\n{text}\n\n"
+        f"请根据内容和上下文给出风险等级，只输出 JSON："
+    )
+
+    risk_profile_1 = llm_chat_json(
+        system_prompt=RISK_SYSTEM_PROMPT_DISCRETE,
+        user_prompt=user_prompt_1,
+        temperature=0.0,
+        max_tokens=1024,
+    )
+
+    # --- 兜底处理：保证结构完整 ---
+    levels_1 = risk_profile_1.get("risk_levels") or {}
+    if not isinstance(levels_1, dict):
+        levels_1 = {}
+
+    for key in RISK_CATEGORIES:
+        levels_1[key] = _norm_level(levels_1.get(key, "NONE"))
+
+    risk_profile_1["risk_levels"] = levels_1
+
+    # 模型给的整体等级（原始）
+    raw_overall_1 = (risk_profile_1.get("overall_risk_level") or "L1").upper()
+
+    # 使用本地规则统一计算整体风险等级
+    overall_1 = compute_overall_risk_level(levels_1, router_ctx)
+    risk_profile_1["overall_risk_level_raw"] = raw_overall_1
+    risk_profile_1["overall_risk_level"] = overall_1
+
+    # 默认结果先设为第一阶段
+    final_profile = dict(risk_profile_1)
+    used_rag = False
+    stage2_profile = None
+
+    # ===== 可选：第二阶段 RAG 复核 =====
+    if use_rag_on_uncertain and is_uncertain_case(levels_1, router_ctx):
+        # 1) RAG 检索相关政策/案例
+        docs = retrieve_relevant_docs(text, top_k=5)
+        if docs:
+            docs_text = format_docs_for_prompt(docs)
+
+            # 2) 带 RAG 的第二阶段检测
+            user_prompt_2 = (
+                f"检测阶段: {mode}（带RAG复核）\n"
+                f"以下是对用户输入的结构化分析结果(路由上下文)：\n"
+                f"{router_ctx_simplified}\n\n"
+                f"下面是与该内容相关的安全政策、使用条款或历史案例片段：\n"
+                f"{docs_text}\n\n"
+                f"下面是需要检测风险的文本：\n{text}\n\n"
+                f"请在参考以上政策/案例的前提下，重新给出风险等级，只输出 JSON："
+            )
+
+            risk_profile_2 = llm_chat_json(
+                system_prompt=RISK_SYSTEM_PROMPT_DISCRETE,
+                user_prompt=user_prompt_2,
+                temperature=0.0,
+                max_tokens=1024,
+            )
+
+            levels_2 = risk_profile_2.get("risk_levels") or {}
+            if not isinstance(levels_2, dict):
+                levels_2 = {}
+            for key in RISK_CATEGORIES:
+                levels_2[key] = _norm_level(levels_2.get(key, "NONE"))
+
+            raw_overall_2 = (risk_profile_2.get("overall_risk_level") or "L1").upper()
+            overall_2 = compute_overall_risk_level(levels_2, router_ctx)
+
+            risk_profile_2["risk_levels"] = levels_2
+            risk_profile_2["overall_risk_level_raw"] = raw_overall_2
+            risk_profile_2["overall_risk_level"] = overall_2
+
+            # 3) 保守合并：逐类取更高等级，再用规则重算整体等级
+            merged_levels = merge_risk_levels(levels_1, levels_2)
+            merged_overall = compute_overall_risk_level(merged_levels, router_ctx)
+
+            final_profile = {
+                "risk_levels": merged_levels,
+                "overall_risk_level": merged_overall,
+                "overall_risk_level_raw": raw_overall_2,
+            }
+            used_rag = True
+            stage2_profile = risk_profile_2
+
+    # 附加 debug 信息（不会影响评估脚本对 risk_levels / overall 的使用）
+    final_profile["debug"] = {
+        "stage1": {
+            "risk_levels": levels_1,
+            "overall_risk_level": overall_1,
+            "overall_risk_level_raw": raw_overall_1,
+        },
+        "stage2": stage2_profile,
+        "used_rag": used_rag,
+    }
+
+    return final_profile
+
+
+if __name__ == "__main__":
+    # 简单测试
+    from routing_hub import analyze_query
+
+    while True:
+        q = input("User> ")
+        if not q:
+            break
+        router_ctx = analyze_query(q)
+        print("router_ctx:", router_ctx)
+        risk = detect_risk_discrete(q, router_ctx, mode="input", use_rag_on_uncertain=True)
+        print("risk_profile:", risk)
+        print("-" * 80)
