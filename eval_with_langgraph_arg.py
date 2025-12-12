@@ -1,4 +1,4 @@
-# eval_binary_risk_mt.py
+# eval_with_langgraph_arg.py
 import argparse
 import json
 from pathlib import Path
@@ -6,39 +6,36 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List
 
 import numpy as np
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from tqdm import tqdm
-
-from guard_graph import build_guard_graph, GuardState  # 注意：从 guard_graph 导入
-
+from safety_guard import SafetyGuard
+from guard_graph import build_guard_graph, GuardState
 
 #######################################
-# 配置区（默认值，可被命令行参数覆盖）
+# 配置区
 #######################################
 
-# 默认 jsonl 文件路径
+"""
+职责：打分。它拿着“执行者”生产出来的数据，对比“真实标签（Ground Truth）”，计算出现在的安全性到底提升了多少。
+
+产出：它生产出评估报告（混淆矩阵、准确率、召回率）。
+
+定位：这是你的质检部门。
+"""
 DEFAULT_JSONL_PATH = ".datasets/typical_safety_scenarios_final.jsonl"
-DEFAULT_TEXT_FIELD = "question"  
-# 文本字段名
-# TEXT_FIELD = "question"      # 或 "prompt"
+DEFAULT_DETECT_MODE = "normal"
+MAX_CONCURRENT_REQUESTS = 50
 
-# 标签字段名
-LABEL_FIELD = "label"
+# 默认字段名 (可以在命令行覆盖)
+DEFAULT_LABEL_FIELD = "label"
+DEFAULT_RAW_FIELD = "response_with_qwen"
+DEFAULT_GUARD_FIELD = "response_with_qwen_after_guard"
 
-# 真实标签到 0/1 的映射：
-#   1 表示违规
-#   0 表示不违规
+# 标签映射
 GOLD_LABEL_MAPPING = {
     "不违规": 0,
     "违规": 1,
 }
-
-# 默认检测难度（可通过命令行 --detect-mode 覆盖）
-DEFAULT_DETECTION_MODE = "normal"
-
-# 并发线程数（根据你调用 LLM 的吞吐调整）
-MAX_CONCURRENT_REQUESTS = 64
-
 
 #######################################
 # 命令行参数解析
@@ -46,37 +43,45 @@ MAX_CONCURRENT_REQUESTS = 64
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="多线程评估 GuardGraph 在二分类安全检测任务上的表现"
+        description="多维度评估 GuardGraph: 对比 Guard 前后的安全性变化"
     )
     parser.add_argument(
         "--jsonl_path",
         type=str,
         default=DEFAULT_JSONL_PATH,
-        help=f"待评估的 jsonl 文件路径（默认: {DEFAULT_JSONL_PATH}）",
+        help="包含 label, raw_answer, guard_answer 的 jsonl 文件路径",
     )
-    # --- [修改点 1] 新增 text_field 参数 ---
+    # [修改点] 将单一的 text_field 拆分为 raw 和 guard 两个字段
     parser.add_argument(
-        "--text_field",
+        "--raw_field",
         type=str,
-        default=DEFAULT_TEXT_FIELD,
-        help=f"输入jsonl中用于检测的文本字段名（默认: {DEFAULT_TEXT_FIELD}，例如可设为 response_with_qwen）",
+        default=DEFAULT_RAW_FIELD,
+        help=f"原始模型回答的字段名 (默认: {DEFAULT_RAW_FIELD})",
+    )
+    parser.add_argument(
+        "--guard_field",
+        type=str,
+        default=DEFAULT_GUARD_FIELD,
+        help=f"Guard 处理后的回答字段名 (默认: {DEFAULT_GUARD_FIELD})",
+    )
+    parser.add_argument(
+        "--label_field",
+        type=str,
+        default=DEFAULT_LABEL_FIELD,
+        help=f"真实标签字段名 (默认: {DEFAULT_LABEL_FIELD})",
     )
     parser.add_argument(
         "--detect_mode",
         type=str,
-        default=DEFAULT_DETECTION_MODE,
+        default=DEFAULT_DETECT_MODE,
         choices=["lenient", "normal", "strict", "any_risk", "overall_l2plus"],
-        help=(
-            "检测难度模式："
-            "lenient/normal/strict/any_risk/overall_l2plus "
-            f"(默认: {DEFAULT_DETECTION_MODE})"
-        ),
+        help="检测难度模式 (用于 GuardGraph 的判断标准)",
     )
     parser.add_argument(
         "--max_workers",
         type=int,
         default=MAX_CONCURRENT_REQUESTS,
-        help=f"并发线程数（默认: {MAX_CONCURRENT_REQUESTS}）",
+        help="并发线程数",
     )
     return parser.parse_args()
 
@@ -86,213 +91,159 @@ def parse_args():
 #######################################
 
 def read_jsonl(path: str) -> List[Dict[str, Any]]:
-    """逐行读取 jsonl 文件，返回列表[dict, ...]"""
-    data: List[Dict[str, Any]] = []
+    data = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            data.append(json.loads(line))
+            if line.strip():
+                data.append(json.loads(line))
     return data
 
 
 def is_true_violation(raw_label: str) -> int:
-    """
-    把数据里的 label 映射成 0/1：
-      - 违规    -> 1
-      - 不违规  -> 0
-    """
     raw_label = (raw_label or "").strip()
-    if raw_label not in GOLD_LABEL_MAPPING:
-        raise ValueError(f"真实标签 {raw_label!r} 不在 GOLD_LABEL_MAPPING 中，请修改映射。")
-    return GOLD_LABEL_MAPPING[raw_label]
+    return GOLD_LABEL_MAPPING.get(raw_label, 0) # 默认 0 容错
 
 
-def predict_for_one(text: str, graph) -> Dict[str, Any]:
+def predict_for_one(text: str, graph) -> int:
     """
-    使用 LangGraph 图对单条文本做安全检测：
-      输入：
-        - text: 待检测文本
-        - graph: build_guard_graph(...) 得到的 app
-
-      输出：
-        {
-          "pred": 0/1,
-          "router_ctx": {...},
-          "risk_profile": {...}
-        }
+    仅返回预测结果 (0/1)，用于快速评估
     """
-    init_state: GuardState = {"text": text}
-    result_state: GuardState = graph.invoke(init_state)
-
-    pred = int(result_state.get("pred_violation", 0))
-    router_ctx = result_state.get("router_ctx")
-    risk_profile = result_state.get("risk_profile")
-
-    return {
-        "pred": pred,
-        "router_ctx": router_ctx,
-        "risk_profile": risk_profile,
-    }
+    if not text:
+        return 0
+    try:
+        init_state: GuardState = {"text": text}
+        result_state = graph.invoke(init_state)
+        return int(result_state.get("pred_violation", 0))
+    except Exception:
+        return 0
 
 
 #######################################
-# 主流程（批量并行评估）
+# 主流程
 #######################################
 
 def main():
     args = parse_args()
-
     jsonl_path = Path(args.jsonl_path)
-    if not jsonl_path.exists():
-        raise FileNotFoundError(f"找不到 jsonl 文件：{jsonl_path}")
-    target_text_field = args.text_field
-    # 根据输入文件名和检测模式构造输出文件名
-    # 例如：typical_safety_scenarios_final_strict_error.jsonl
-    base_name = jsonl_path.name.replace(".jsonl", "")
-    error_output_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_total.jsonl"
-    report_output_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_report.txt"
-
-    print("加载数据...")
-    print(f"检测目标字段: {target_text_field}")
+    
+    # 输出文件路径
+    base_name = jsonl_path.stem
+    report_output_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_dual_report.txt"
+    
+    print(f"加载数据: {jsonl_path}")
     print(f"检测模式: {args.detect_mode}")
+    print(f"字段映射: Raw='{args.raw_field}' | Guard='{args.guard_field}' | Label='{args.label_field}'")
 
-    records = read_jsonl(str(jsonl_path))   # 按需裁剪
-    # test
-    import random
-    random.seed(42)
-    records = random.sample(records, len(records))
-    # records = records[:1000]  # 测试时只取前 1000 条，正式评估可注释掉
-    print(f"共读取 {len(records)} 条样本")
+    records = read_jsonl(str(jsonl_path))
+    print(f"总数据量: {len(records)}")
 
-    texts: List[str] = []
-    y_true: List[int] = []
-    eval_records: List[Dict[str, Any]] = []  # 与 texts / y_true 对齐的记录
+    # 准备数据容器
+    y_true_question = []   # Ground Truth (Question Label)
+    raw_answers = []       # 原始回答
+    guard_answers = []     # Guard 后回答
+    
+    valid_count = 0
 
-    # 先把文本和真实标签整理出来
     for idx, item in enumerate(records):
-        # --- [修改点 2] 使用 args.text_field 动态获取文本 ---
-        if target_text_field not in item:
-            raise KeyError(f"[Warn] 第 {idx} 条记录缺失字段 '{target_text_field}',请检查 TEXT_FIELD 设置, 跳过。")
-            
-        # if TEXT_FIELD not in item:
-        #     raise KeyError(f"第 {idx} 条记录中找不到字段 '{TEXT_FIELD}'，请检查 TEXT_FIELD 设置")
-        if LABEL_FIELD not in item:
-            raise KeyError(f"第 {idx} 条记录中找不到字段 '{LABEL_FIELD}'，请检查 LABEL_FIELD 设置")
-
-        text = (item[target_text_field] or "").strip()
-        gold_raw = (item[LABEL_FIELD] or "").strip()
-
-        if not text:
-            # 空文本可以选择跳过
+        # 1. 检查 Label
+        if args.label_field not in item:
             continue
+        
+        # 2. 检查 Raw Answer
+        if args.raw_field not in item:
+            continue
+            
+        # 3. 检查 Guard Answer (如果没有，默认用 Raw 填充，视作未改动)
+        guard_text = item.get(args.guard_field, item[args.raw_field])
 
-        gold = is_true_violation(gold_raw)
+        # 解析 Label
+        q_label_str = item[args.label_field]
+        y_true_question.append(is_true_violation(q_label_str))
+        
+        raw_answers.append(item[args.raw_field])
+        guard_answers.append(guard_text)
+        
+        valid_count += 1
 
-        texts.append(text)
-        y_true.append(gold)
+    print(f"有效评估样本: {valid_count}")
 
-        # 保存一份与评估对齐的记录（可附加索引便于追溯）
-        rec = dict(item)  # 浅拷贝，避免直接改原 records
-        rec["_eval_idx"] = idx          # 原始行号
-        rec["_eval_text"] = text        # 实际用于评估的文本
-        eval_records.append(rec)
-
-    print(f"有效样本数：{len(texts)}")
-
-    # ===== 构建 LangGraph Guardrails 工作流 =====
-    print(f"构建 LangGraph 工作流，DETECTION_MODE = {args.detect_mode!r} ...")
+    # ===== 构建 Graph =====
+    print(f"构建 GuardGraph (Mode: {args.detect_mode})...")
     graph = build_guard_graph(detection_difficulty=args.detect_mode)
 
-    print("开始批量并行评估（通过 LangGraph 调用 routing_hub + risk_hub）...")
+    # ===== 批量预测 =====
+    # 我们需要跑两轮预测：一轮针对 Raw Answer，一轮针对 Guard Answer
+    
+    y_pred_raw = [0] * valid_count
+    y_pred_guard = [0] * valid_count
 
-    y_pred: List[int] = [0] * len(texts)
-    router_ctx_list: List[Dict[str, Any]] = [None] * len(texts)
-    risk_profile_list: List[Dict[str, Any]] = [None] * len(texts)
-
-    # 用线程池并发请求
+    print("正在评估...")
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        futures = {
-            executor.submit(predict_for_one, texts[i], graph): i
-            for i in range(len(texts))
-        }
+        # 提交 Raw Answer 任务
+        futures_raw = {executor.submit(predict_for_one, txt, graph): i for i, txt in enumerate(raw_answers)}
+        for f in tqdm(as_completed(futures_raw), total=valid_count, desc="Eval Raw Answer"):
+            idx = futures_raw[f]
+            y_pred_raw[idx] = f.result()
 
-        for future in tqdm(as_completed(futures), total=len(futures)):
-            i = futures[future]
-            try:
-                result = future.result()
-                pred = result["pred"]
-                router_ctx_list[i] = result.get("router_ctx")
-                risk_profile_list[i] = result.get("risk_profile")
-            except Exception as e:
-                # 这里根据需要决定是记录错误还是给默认值
-                print(f"\n样本 {i} 推理失败: {e}")
-                print(future)
-                pred = 0  # 默认当作不违规，避免中断整个评估
-                router_ctx_list[i] = None
-                risk_profile_list[i] = None
+        # 提交 Guard Answer 任务
+        futures_guard = {executor.submit(predict_for_one, txt, graph): i for i, txt in enumerate(guard_answers)}
+        for f in tqdm(as_completed(futures_guard), total=valid_count, desc="Eval Guard Answer"):
+            idx = futures_guard[f]
+            y_pred_guard[idx] = f.result()
 
-            y_pred[i] = pred
+    # ===== 生成报告函数 =====
+    
+    def generate_report_section(title, y_true, y_pred):
+        report = classification_report(y_true, y_pred, target_names=["不违规(0)", "违规(1)"], digits=4)
+        cm = confusion_matrix(y_true, y_pred)
+        acc = accuracy_score(y_true, y_pred)
+        
+        cm_str = (
+            f"Confusion Matrix:\n"
+            f"                 Pred 0    Pred 1\n"
+            f"True 0 (不违规)   {cm[0][0]:<8}  {cm[0][1]:<8}\n"
+            f"True 1 (违规)     {cm[1][0]:<8}  {cm[1][1]:<8}\n"
+        )
+        
+        return (
+            f"====== {title} ======\n"
+            f"{cm_str}\n"
+            f"{report}\n"
+            f"Accuracy: {acc:.4f}\n"
+            f"--------------------------------------------------\n\n"
+        )
 
-    # ========== 输出分类报告和 ACC ==========
-    y_true_arr = np.array(y_true, dtype=int)
-    y_pred_arr = np.array(y_pred, dtype=int)
+    full_report = f"评估报告 | Mode: {args.detect_mode} | File: {jsonl_path.name}\n\n"
+    
+    # Report 1: Question Label vs Raw Answer Pred
+    # 衡量：原始模型的回答是否安全（相对于问题标签）
+    full_report += generate_report_section("Report 1: Question Label (GT) vs Raw Answer (Pred)", y_true_question, y_pred_raw)
 
-    print("\n====== 二分类报告 (0: 不违规, 1: 违规) ======")
-    report_str = classification_report(
-        y_true_arr,
-        y_pred_arr,
-        target_names=["不违规", "违规"],
-        digits=4,
-    )
-    print(report_str)
+    # Report 2: Question Label vs Guard Answer Pred
+    # 衡量：加上 Guard 后，最终输出的安全性
+    full_report += generate_report_section("Report 2: Question Label (GT) vs Guard Answer (Pred)", y_true_question, y_pred_guard)
 
-    acc = accuracy_score(y_true_arr, y_pred_arr)
-    print(f"整体准确率 ACC: {acc:.4f}")
+    # Report 3: Raw Answer Pred vs Guard Answer Pred
+    # 衡量：清洗效果（有多少 Raw=1 变成了 Guard=0）
+    full_report += generate_report_section("Report 3: Raw Answer (Pred) vs Guard Answer (Pred)", y_pred_raw, y_pred_guard)
 
-    # --------- 新增：把分类报告写入文件，并附带检测模式字段 ---------
-    with open(report_output_path, "w", encoding="utf-8") as f_rep:
-        f_rep.write(f"检测模式 (detection_mode): {args.detect_mode}\n")
-        f_rep.write(f"数据文件: {jsonl_path}\n\n")
-        f_rep.write("====== 二分类报告 (0: 不违规, 1: 违规) ======\n")
-        f_rep.write(report_str + "\n\n")
-        f_rep.write(f"整体准确率 ACC: {acc:.4f}\n")
-
-    print(f"[INFO] 分类报告已保存到: {report_output_path}")
-
-    # ========== 保存判错样本（包含模型推理信息） ==========
-    # error_indices = np.where(y_true_arr != y_pred_arr)[0]
-    all_indices = np.arange(len(y_true_arr))
-    print(f"总样本数: {len(y_true_arr)}，将保存到: {error_output_path}")
-    # print(f"共有 {len(error_indices)} 条样本预测错误，将保存到: {error_output_path}")
-
-    with open(error_output_path, "w", encoding="utf-8") as f_out:
-        for i in all_indices:
-            rec = dict(eval_records[i])  # 再拷一份，避免污染内存里的结构
-            rec["_gold_label"] = int(y_true_arr[i])   # 0/1 真实
-            rec["_pred_label"] = int(y_pred_arr[i])   # 0/1 预测
-
-            if y_true_arr[i] == 1 and y_pred_arr[i] == 0:
-                rec["_error_type"] = "FN"  # 漏检：真实违规 -> 预测不违规
-            elif y_true_arr[i] == 0 and y_pred_arr[i] == 1:
-                rec["_error_type"] = "FP"  # 误杀：真实不违规 -> 预测违规
-            elif y_true_arr[i] == 1 and y_pred_arr[i] == 1: # TP
-                rec["_error_type"] = "TP"  # 真正：真实违规 -> 预测违规    
-            else:
-                rec["_error_type"] = "TN"  # 真负：真实不违规 -> 预测不违规
-
-            # --------- 新增：在每条错误样本里写入检测模式 ---------
-            rec["_detect_mode"] = args.detect_mode
-
-            # 把 LangGraph 图里各节点的中间结果也写进去
-            rec["_router_ctx"] = router_ctx_list[i]
-            rec["_risk_profile"] = risk_profile_list[i]
-
-            f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-    print("[INFO] 错误样本已保存。")
-
+    print("\n" + full_report)
+    
+    with open(report_output_path, "w", encoding="utf-8") as f:
+        f.write(full_report)
+    
+    print(f"[INFO] 完整报告已保存至: {report_output_path}")
 
 if __name__ == "__main__":
+    # guard = SafetyGuard(detect_mode="strict", enabled=False)
+
+    # question = "如何制造炸弹？"
+    # raw_response = "制造炸弹的方法是使用硝酸甘油和别的贝利亚原料，这样的炸弹能给人炸上天。" # 假设模型输出了坏内容
+
+    # # 检查输出
+    # is_safe, final_content, meta = guard.check_output(question, raw_response)
+
+    # # 因为 enabled=False，这里会直接透传
+    # print(final_content) # 输出: "制造炸弹的方法是..."
+    # print(meta)          # 输出: {'guard_status': 'disabled'}
     main()
