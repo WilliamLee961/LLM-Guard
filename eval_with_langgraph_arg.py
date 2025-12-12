@@ -17,10 +17,10 @@ from guard_graph import build_guard_graph, GuardState  # 注意：从 guard_grap
 #######################################
 
 # 默认 jsonl 文件路径
-DEFAULT_JSONL_PATH = "../typical_safety_scenarios_final.jsonl"
-
+DEFAULT_JSONL_PATH = ".datasets/typical_safety_scenarios_final.jsonl"
+DEFAULT_TEXT_FIELD = "question"  
 # 文本字段名
-TEXT_FIELD = "question"      # 或 "prompt"
+# TEXT_FIELD = "question"      # 或 "prompt"
 
 # 标签字段名
 LABEL_FIELD = "label"
@@ -53,6 +53,13 @@ def parse_args():
         type=str,
         default=DEFAULT_JSONL_PATH,
         help=f"待评估的 jsonl 文件路径（默认: {DEFAULT_JSONL_PATH}）",
+    )
+    # --- [修改点 1] 新增 text_field 参数 ---
+    parser.add_argument(
+        "--text_field",
+        type=str,
+        default=DEFAULT_TEXT_FIELD,
+        help=f"输入jsonl中用于检测的文本字段名（默认: {DEFAULT_TEXT_FIELD}，例如可设为 response_with_qwen）",
     )
     parser.add_argument(
         "--detect_mode",
@@ -140,15 +147,23 @@ def main():
     jsonl_path = Path(args.jsonl_path)
     if not jsonl_path.exists():
         raise FileNotFoundError(f"找不到 jsonl 文件：{jsonl_path}")
-
+    target_text_field = args.text_field
     # 根据输入文件名和检测模式构造输出文件名
     # 例如：typical_safety_scenarios_final_strict_error.jsonl
     base_name = jsonl_path.name.replace(".jsonl", "")
-    error_output_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_error.jsonl"
+    error_output_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_total.jsonl"
     report_output_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_report.txt"
 
     print("加载数据...")
+    print(f"检测目标字段: {target_text_field}")
+    print(f"检测模式: {args.detect_mode}")
+
     records = read_jsonl(str(jsonl_path))   # 按需裁剪
+    # test
+    import random
+    random.seed(42)
+    records = random.sample(records, len(records))
+    # records = records[:1000]  # 测试时只取前 1000 条，正式评估可注释掉
     print(f"共读取 {len(records)} 条样本")
 
     texts: List[str] = []
@@ -157,12 +172,16 @@ def main():
 
     # 先把文本和真实标签整理出来
     for idx, item in enumerate(records):
-        if TEXT_FIELD not in item:
-            raise KeyError(f"第 {idx} 条记录中找不到字段 '{TEXT_FIELD}'，请检查 TEXT_FIELD 设置")
+        # --- [修改点 2] 使用 args.text_field 动态获取文本 ---
+        if target_text_field not in item:
+            raise KeyError(f"[Warn] 第 {idx} 条记录缺失字段 '{target_text_field}',请检查 TEXT_FIELD 设置, 跳过。")
+            
+        # if TEXT_FIELD not in item:
+        #     raise KeyError(f"第 {idx} 条记录中找不到字段 '{TEXT_FIELD}'，请检查 TEXT_FIELD 设置")
         if LABEL_FIELD not in item:
             raise KeyError(f"第 {idx} 条记录中找不到字段 '{LABEL_FIELD}'，请检查 LABEL_FIELD 设置")
 
-        text = (item[TEXT_FIELD] or "").strip()
+        text = (item[target_text_field] or "").strip()
         gold_raw = (item[LABEL_FIELD] or "").strip()
 
         if not text:
@@ -243,11 +262,13 @@ def main():
     print(f"[INFO] 分类报告已保存到: {report_output_path}")
 
     # ========== 保存判错样本（包含模型推理信息） ==========
-    error_indices = np.where(y_true_arr != y_pred_arr)[0]
-    print(f"共有 {len(error_indices)} 条样本预测错误，将保存到: {error_output_path}")
+    # error_indices = np.where(y_true_arr != y_pred_arr)[0]
+    all_indices = np.arange(len(y_true_arr))
+    print(f"总样本数: {len(y_true_arr)}，将保存到: {error_output_path}")
+    # print(f"共有 {len(error_indices)} 条样本预测错误，将保存到: {error_output_path}")
 
     with open(error_output_path, "w", encoding="utf-8") as f_out:
-        for i in error_indices:
+        for i in all_indices:
             rec = dict(eval_records[i])  # 再拷一份，避免污染内存里的结构
             rec["_gold_label"] = int(y_true_arr[i])   # 0/1 真实
             rec["_pred_label"] = int(y_pred_arr[i])   # 0/1 预测
@@ -256,8 +277,10 @@ def main():
                 rec["_error_type"] = "FN"  # 漏检：真实违规 -> 预测不违规
             elif y_true_arr[i] == 0 and y_pred_arr[i] == 1:
                 rec["_error_type"] = "FP"  # 误杀：真实不违规 -> 预测违规
+            elif y_true_arr[i] == 1 and y_pred_arr[i] == 1: # TP
+                rec["_error_type"] = "TP"  # 真正：真实违规 -> 预测违规    
             else:
-                rec["_error_type"] = "OTHER"
+                rec["_error_type"] = "TN"  # 真负：真实不违规 -> 预测不违规
 
             # --------- 新增：在每条错误样本里写入检测模式 ---------
             rec["_detect_mode"] = args.detect_mode

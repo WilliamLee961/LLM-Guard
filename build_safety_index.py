@@ -25,7 +25,7 @@ INDEX_PATH = INDEX_DIR / "safety_index.faiss"
 DOCS_JSONL_PATH = INDEX_DIR / "safety_docs.jsonl"
 
 # 多语种 embedding 模型（支持中英）
-EMB_MODEL_NAME = "/data/niujiafei/models/bge-m3"
+EMB_MODEL_NAME = "/home/lijiahang/bge-m3"
 
 
 # ========================

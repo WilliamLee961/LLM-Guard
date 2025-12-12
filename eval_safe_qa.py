@@ -16,10 +16,10 @@ from safe_qa_graph import build_safe_qa_graph, QAState
 #######################################
 
 # jsonl 文件路径
-JSONL_PATH = "../ChineseSafe.jsonl"
+JSONL_PATH = "./results/results_en/simply_Qwen_answer_strict_total.jsonl"
 
 # 文本字段名
-TEXT_FIELD = "question"      # 或 "prompt"
+TEXT_FIELD = "response_with_qwen"      # 或 "prompt"
 
 # 标签字段名
 LABEL_FIELD = "label"
@@ -39,22 +39,22 @@ GOLD_LABEL_MAPPING = {
 #   - 兼容老模式：
 #       "any_risk"       : 任意非 NONE 即违规
 #       "overall_l2plus" : overall ∈ {L2,L3,L4} 即违规
-DETECTION_MODE = "normal"
+DETECTION_MODE = "strict"
 
 # 评估时怎么用输入/输出侧的结果压成一个二分类：
 #   - "input_only"       : 只看输入侧 input_violation
 #   - "output_only"      : 只看输出侧 output_violation（注意：模型回答要跑一遍）
 #   - "input_or_output"  : 只要输入 or 输出任一侧判违规，就算违规
-AGG_MODE = "input_or_output"
+AGG_MODE = "output_only"
 
 # 并发线程数（根据你调用 LLM 的吞吐调整）
 MAX_CONCURRENT_REQUESTS = 32
 
 # 错误样本保存路径（jsonl）
-ERROR_OUTPUT_PATH = "./eval_safe_qa_errors.jsonl"
+ERROR_OUTPUT_PATH = "./results/results_en/eval_safe_qa_errors.jsonl"
 
 # 是否裁剪样本数量（例如只评估前 2000 条），None 表示用全部
-MAX_SAMPLES = None    # 比如想只跑 2000，可以改成 2000
+MAX_SAMPLES = 100    # 比如想只跑 2000，可以改成 2000
 
 
 #######################################

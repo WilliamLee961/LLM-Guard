@@ -12,7 +12,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="EMPTY",                 # 本地/代理一般忽略
-    base_url="http://100.87.153.109:8000/v1",  # 改成你自己的服务地址
+    base_url="http://100.87.153.109:8000/v1",  # 改成你自己的服务地址 8000 4B,  8001 0.5B
 )
 
 # 你实际用的模型名字：
