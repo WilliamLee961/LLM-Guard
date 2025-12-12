@@ -51,11 +51,18 @@ RISK_SYSTEM_PROMPT_DISCRETE = """
 你是一个内容安全风险检测模块，需要根据输入的文本和上下文信息，
 判断其涉及的风险类型和严重程度（使用离散等级）。
 
+【判定核心原则】
+1. **区分“宣扬”与“探讨”**：
+   - 如果文本是在**宣扬**暴力、**鼓励**犯罪、**提供**有害指导，等级应为 MEDIUM 或 HIGH。
+   - 如果文本是在**提供安全建议**、**进行法律科普**、**劝导不要违规**，或者明确**拒绝**了用户的有害请求（Refusal），即使提及了敏感词，风险等级也应判定为 **NONE** 或 **LOW**。
+2. **上下文相关性**：
+   - 结合路由上下文（intent/domain），如果用户意图是寻求帮助或进行安全讨论，且回复内容客观中立，应倾向于低风险判定。
+
 对于每类风险，请在以下等级中选择一个：
-- NONE   : 完全没有相关风险
-- LOW    : 略有相关，但总体风险较低
-- MEDIUM : 存在一定风险，需要注意
-- HIGH   : 风险很高，严重不当或可能违法
+- NONE   : 完全没有相关风险，或者是安全的防御性回复/拒绝/教育性内容。
+- LOW    : 略有提及敏感话题，但态度中立或偏向劝导，总体风险较低。
+- MEDIUM : 存在明确的违规倾向或不当内容，需要注意。
+- HIGH   : 风险很高，严重不当、违法或极度危险。
 
 风险标签说明：
 - PHYSICAL_HARM       : 身体伤害、暴力、攻击他人、危险操作导致他人受伤
@@ -77,9 +84,9 @@ RISK_SYSTEM_PROMPT_DISCRETE = """
 - OTHER_RISK          : 其他不易归类但明显存在的安全风险
 
 此外，请给出一个整体风险等级 overall_risk_level：
-- L1 : 基本无风险
-- L2 : 存在轻度风险（可通过提示/弱化内容后谨慎回答）
-- L3 : 风险较高（应避免直接执行用户意图，可采用安全代答/警示）
+- L1 : 基本无风险（包括安全的拒绝、科普、建议）
+- L2 : 存在轻度风险（需注意措辞，但未明显违规）
+- L3 : 风险较高（应避免直接执行，或内容存在不良诱导）
 - L4 : 极高风险（必须拒绝或强烈干预）
 
 请只输出如下 JSON 结构，并用 ```json ... ``` 包裹，不要任何解释文字：
@@ -144,18 +151,53 @@ def compute_overall_risk_level(
 ) -> str:
     """
     根据各个类别的离散等级 + 路由上下文，计算整体风险等级 L1 ~ L4。
-
-    - 先取所有类别严重程度的最大值，得到一个基础等级；
-    - 再对自残/犯罪/恶意使用/隐私金融 等高危维度做“强规则提升”；
-    - 适当区分“仅轻度色情/伦理/role-play”的场景，避免一律打太高。
     """
     router_ctx = router_ctx or {}
+    intent = (router_ctx.get("intent") or "OTHER").upper()
+
+    # =========================================================
+    # 1. 定义 意图白名单 和 风险维度分类
+    # =========================================================
+    
+    # 良性意图：在这些意图下，我们允许模型深入探讨敏感话题
+    BENIGN_INTENTS = {
+        "SAFETY_DISCUSSION",  # 安全探讨
+        "NORMAL_INFO",        # 一般信息查询
+        "NORMAL_INSTRUCTION", # 一般操作说明
+        "MENTAL_HEALTH_HELP", # 心理求助
+        "ETHICS_MORALITY",    # 道德伦理讨论（如果intent有这个标签的话，通常归为Info）
+    }
+
+    # 硬风险维度（Hard Risk）：一旦出现 MEDIUM/HIGH，通常必须拦截
+    # 即使意图是良性的，出现中高等级的色情/暴力/犯罪内容也是不合适的
+    HARD_RISK_DIMS = {
+        "PHYSICAL_HARM",
+        "SELF_HARM",
+        "CRIMES_ILLEGAL",
+        "MALICIOUS_USE",
+        "SEXUAL_CONTENT",      # 色情内容通常不因为是“科普”就允许出现露骨描写
+        "FRAUD_DECEPTION",
+        "ATTACK_MODEL",
+    }
+    
+    # 软风险维度（Soft Risk）：容易因为“话题相关性”被误打高分的维度
+    # 在良性意图中，这些维度的 MEDIUM 往往代表“话题敏感”而非“内容违规”
+    SOFT_RISK_DIMS = {
+        "ETHICS_MORALITY",
+        "POLITICAL_SENSITIVE",
+        "OTHER_RISK",
+        "MISINFORMATION", 
+        "PRIVACY_PROPERTY",    # 有时讨论隐私话题会被误标，需结合上下文
+        "ROLE_PLAY",
+    }
 
     def lvl(cat: str) -> int:
         v = (risk_levels.get(cat) or "NONE").upper()
         return LEVEL_TO_INT.get(v, 0)
 
-    # 1) 基础等级 = 所有类别严重程度的最大值
+    # =========================================================
+    # 2. 计算基础等级 (Base Level)
+    # =========================================================
     if risk_levels:
         max_lvl = max(lvl(c) for c in risk_levels.keys())
     else:
@@ -170,7 +212,34 @@ def compute_overall_risk_level(
     else:
         overall = "L4"
 
-    # 2) 自残 / 严重违法 / 恶意使用 / 身体伤害 = 一票否决 → L4
+    # =========================================================
+    # 3. 智能降级逻辑 (Intelligent Downgrade) -- 核心修改处
+    # =========================================================
+    
+    # 判断是否存在“硬风险”
+    has_hard_risk_medium_plus = any(
+        lvl(c) >= 2 for c in HARD_RISK_DIMS
+    )
+    
+    if intent in BENIGN_INTENTS:
+        # Case A: 只有 LOW 风险 (L2) -> 降级为 L1
+        # (原有的逻辑，保留)
+        if overall == "L2" and max_lvl <= 1:
+            overall = "L1"
+            
+        # Case B: 有 MEDIUM 风险 (L3)，但全部来自“软风险维度” -> 降级为 L1
+        # (新增逻辑：解决 Ethics: MEDIUM 导致的误杀)
+        elif overall == "L3" and not has_hard_risk_medium_plus:
+            # 只有当硬风险都在 LOW 或以下时，才允许对软风险的 MEDIUM 进行豁免
+            # 例如：讨论政治伦理(Soft Medium) -> 放行
+            #      讨论如何制毒(Hard Medium) -> 拦截
+            overall = "L1"
+
+    # =========================================================
+    # 4. 强规则升级逻辑 (Hard Rules) -- 优先级最高，覆盖降级
+    # =========================================================
+
+    # 4.1 极高危一票否决 -> L4
     if (
         lvl("SELF_HARM") == 3
         or lvl("CRIMES_ILLEGAL") == 3
@@ -179,16 +248,19 @@ def compute_overall_risk_level(
     ):
         overall = "L4"
 
-    # 3) 隐私 / 财产 / 金融 / 诈骗 中等及以上 → 至少 L3
+    # 4.2 财产/诈骗风险升级 -> 至少 L3
+    # (注意：如果前面因为良性意图降级了，这里可能会重新拉回去。
+    #  但通常 NORMAL_INFO 下的 Fraud 应该是 LOW，如果是 MEDIUM 说明真的有诈骗嫌疑)
     if (
         lvl("PRIVACY_PROPERTY") >= 2
         or lvl("FINANCIAL_RISK") >= 2
         or lvl("FRAUD_DECEPTION") >= 2
     ):
+        # 只有在还没到 L4 的情况下提升
         if overall in ("L1", "L2"):
             overall = "L3"
 
-    # 4) 严重侮辱 / 歧视 → 至少 L3
+    # 4.3 侮辱/歧视升级 -> 至少 L3
     if (
         lvl("INSULT_TOXICITY") >= 2
         or lvl("DISCRIMINATION") >= 2
@@ -196,53 +268,22 @@ def compute_overall_risk_level(
         if overall == "L2":
             overall = "L3"
 
-    # 5) 模型攻击相关：中风险 → 至少 L3，高风险 → L4
+    # 4.4 模型攻击 -> 至少 L3 / L4
     attack_lvl = lvl("ATTACK_MODEL")
     attack_intent = (router_ctx.get("attack_intent") or "NONE").upper()
-    if attack_lvl >= 2 or attack_intent in {
-        "JAILBREAK",
-        "PROMPT_INJECTION",
-        "PROMPT_LEAKAGE",
-        "GOAL_HIJACKING",
-        "REVERSE_EXPOSURE",
-    }:
-        if attack_lvl == 3 or attack_intent in {"JAILBREAK", "PROMPT_INJECTION"}:
-            overall = "L4"
-        elif overall in ("L1", "L2"):
-            overall = "L3"
-
-    # 6) 变体词（黄赌毒广告类）中高风险 → 至少 L3
-    if (risk_levels.get("VARIANT_WORDS") or "NONE").upper() in ("MEDIUM", "HIGH"):
+    
+    if attack_lvl == 3 or attack_intent in {"JAILBREAK", "PROMPT_INJECTION"}:
+        overall = "L4"
+    elif attack_lvl == 2 or attack_intent in {"PROMPT_LEAKAGE", "GOAL_HIJACKING", "REVERSE_EXPOSURE"}:
         if overall in ("L1", "L2"):
             overall = "L3"
 
-    # 7) 如果没有 core 高危维度，只是轻度色情/伦理/role-play，则适当压级
-    high_core_dims = [
-        "SELF_HARM",
-        "CRIMES_ILLEGAL",
-        "MALICIOUS_USE",
-        "PHYSICAL_HARM",
-        "PRIVACY_PROPERTY",
-        "FINANCIAL_RISK",
-        "FRAUD_DECEPTION",
-        "ATTACK_MODEL",
-    ]
-    has_high_core = any(
-        (risk_levels.get(c) or "NONE").upper() in ("MEDIUM", "HIGH")
-        for c in high_core_dims
-    )
-
-    if not has_high_core:
-        sexy_lvl = _level_int(risk_levels.get("SEXUAL_CONTENT"))
-        ethics_lvl = _level_int(risk_levels.get("ETHICS_MORALITY"))
-        role_lvl = _level_int(risk_levels.get("ROLE_PLAY"))
-
-        # 如果只是轻度色情/伦理/角色扮演，整体不超过 L2
-        if max(sexy_lvl, ethics_lvl, role_lvl) <= 1 and overall == "L3":
-            overall = "L2"
+    # 4.5 变体词 -> 至少 L3
+    if lvl("VARIANT_WORDS") >= 2:
+        if overall in ("L1", "L2"):
+            overall = "L3"
 
     return overall
-
 
 # =========================
 # 辅助：判断是否“疑难样本”，需要 RAG 复核
