@@ -8,6 +8,7 @@ from guard_graph import build_guard_graph, GuardState
 from safe_qa_graph import safe_answer_node, QAState
 from routing_hub import analyze_query
 from risk_hub import detect_risk_discrete
+import faiss
 
 class SafetyGuard:
     """

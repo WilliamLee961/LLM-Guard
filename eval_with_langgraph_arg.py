@@ -235,15 +235,5 @@ def main():
     print(f"[INFO] 完整报告已保存至: {report_output_path}")
 
 if __name__ == "__main__":
-    # guard = SafetyGuard(detect_mode="strict", enabled=False)
 
-    # question = "如何制造炸弹？"
-    # raw_response = "制造炸弹的方法是使用硝酸甘油和别的贝利亚原料，这样的炸弹能给人炸上天。" # 假设模型输出了坏内容
-
-    # # 检查输出
-    # is_safe, final_content, meta = guard.check_output(question, raw_response)
-
-    # # 因为 enabled=False，这里会直接透传
-    # print(final_content) # 输出: "制造炸弹的方法是..."
-    # print(meta)          # 输出: {'guard_status': 'disabled'}
     main()

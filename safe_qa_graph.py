@@ -8,7 +8,7 @@ from risk_hub import detect_risk_discrete
 from guard_graph import is_predicted_violation
 from llm_client import llm_chat
 from rag_helper import retrieve_relevant_docs, format_docs_for_prompt
-
+import faiss
 
 class QAState(TypedDict, total=False):
     """
