@@ -1,6 +1,6 @@
 # rag_helper.py
 """
-安全 RAG 辅助模块（GPU 版 FAISS）
+安全 RAG 辅助模块（CPU 版 FAISS 修复版）
 
 功能：
 - 从 safety_knowledge/indexes/ 中加载：
@@ -11,38 +11,53 @@
     - retrieve_relevant_docs(...)    : 高层封装，结合 routing 上下文自动选风险标签等
     - format_docs_for_prompt(docs)   : 将检索结果格式化为 LLM 提示文本
 
-GPU 使用说明：
-- 通过 USE_FAISS_GPU 开关控制是否使用 GPU 版 Faiss。
-- 如果 USE_FAISS_GPU=True，但初始化 GPU 失败，会自动回退到 CPU 版本。
+修复说明：
+1. 强制使用 CPU FAISS，避免 GPU 初始化问题。
+2. 增加 os.path.expanduser 处理，支持 ~/bge-m3 这种路径写法。
 """
 
 from __future__ import annotations
 
+import os  # [Fix] 引入 os 以处理路径展开
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-# import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
+
+# [Fix] 健壮导入 faiss，防止环境缺失
+try:
+    import faiss
+except ImportError:
+    print("[RAG Warning] 未检测到 faiss 库，RAG 功能将不可用。请运行 pip install faiss-cpu")
+    faiss = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    print("[RAG Warning] 未检测到 sentence_transformers 库。")
+    SentenceTransformer = None
 
 # =========================
 # 配置区
 # =========================
 
 # 根目录：与你构建索引脚本中的 ROOT_DIR 保持一致
-ROOT_DIR = Path("safety_knowledge")
+# 使用 os.getenv 支持环境变量覆盖，增加灵活性
+ROOT_DIR = Path(os.getenv("RAG_KNOWLEDGE_DIR", "safety_knowledge"))
 
 # 索引与文档信息路径
 INDEX_DIR = ROOT_DIR / "indexes"
 INDEX_PATH = INDEX_DIR / "safety_index.faiss"
 DOCS_JSONL_PATH = INDEX_DIR / "safety_docs.jsonl"
 
-# 向量模型：与 build_safety_index.py 中保持一致
-EMB_MODEL_NAME = "/data/niujiafei/models/bge-m3"
+# 向量模型：支持 ~ 符号
+# [Fix] 这里默认改为你报错日志里的路径，确保能跑通
+EMB_MODEL_NAME = "~/bge-m3"  
 
 # 是否使用 GPU 版本 FAISS
-USE_FAISS_GPU = True  # 如需禁用 GPU，改为 False 即可
+# [Fix] 强制改为 False，满足你的 CPU 需求
+USE_FAISS_GPU = False  
 
 # 使用哪块 GPU（多卡机器时可调整）
 GPU_DEVICE_ID = 0
@@ -51,10 +66,10 @@ GPU_DEVICE_ID = 0
 # 全局懒加载句柄
 # =========================
 
-_index: Optional[faiss.Index] = None
+_index: Optional[Any] = None  # 类型标注放宽，避免 faiss 未导入时的报错
 _docs: List[Dict[str, Any]] = []
-_emb_model: Optional[SentenceTransformer] = None
-_gpu_res: Optional[faiss.StandardGpuResources] = None
+_emb_model: Optional[Any] = None
+_gpu_res: Optional[Any] = None
 
 
 # =========================
@@ -75,14 +90,25 @@ def _lazy_load() -> None:
     if _index is not None and _docs and _emb_model is not None:
         return
 
+    if faiss is None:
+        raise ImportError("缺少 faiss 库，无法加载索引。")
+
     if not INDEX_PATH.exists():
-        raise FileNotFoundError(f"[RAG] 找不到索引文件: {INDEX_PATH}")
+        # 这里只是警告，不抛出异常，防止文件还没生成时整个程序挂掉
+        print(f"[RAG Warning] 找不到索引文件: {INDEX_PATH}，RAG 将不可用。")
+        return
+        
     if not DOCS_JSONL_PATH.exists():
-        raise FileNotFoundError(f"[RAG] 找不到文档信息文件: {DOCS_JSONL_PATH}")
+        print(f"[RAG Warning] 找不到文档信息文件: {DOCS_JSONL_PATH}")
+        return
 
     # 1. 读取 CPU index
     print(f"[RAG] 从磁盘读取 CPU 索引: {INDEX_PATH}")
-    cpu_index = faiss.read_index(str(INDEX_PATH))
+    try:
+        cpu_index = faiss.read_index(str(INDEX_PATH))
+    except Exception as e:
+        print(f"[RAG Error] 索引读取失败: {e}")
+        return
 
     # 2. 如配置为使用 GPU，则尝试转为 GPU index
     if USE_FAISS_GPU:
@@ -102,22 +128,39 @@ def _lazy_load() -> None:
     # 3. 加载 docs 列表
     print(f"[RAG] 加载文档元信息: {DOCS_JSONL_PATH}")
     _docs.clear()
-    with DOCS_JSONL_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            _docs.append(obj)
+    try:
+        with DOCS_JSONL_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    _docs.append(obj)
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        print(f"[RAG Error] 文档加载失败: {e}")
 
     print(f"[RAG] 文档总数: {len(_docs)}")
 
     # 4. 加载向量模型
-    print(f"[RAG] 加载 embedding 模型: {EMB_MODEL_NAME}")
-    _emb_model = SentenceTransformer(EMB_MODEL_NAME)
+    # [Fix] 关键修复：展开用户路径 (~)
+    real_model_path = os.path.expanduser(EMB_MODEL_NAME)
+    print(f"[RAG] 加载 embedding 模型: {real_model_path}")
+    
+    if SentenceTransformer is None:
+        raise ImportError("缺少 sentence_transformers 库，无法加载模型。")
+
+    try:
+        # device='cpu' 确保模型也跑在 CPU 上，如果想让 Embedding 跑 GPU，可以改为 'cuda'
+        # 这里为了稳妥起见，如果你想要纯 CPU 环境，用 'cpu'；如果你有显卡想加速模型计算，用 'cuda'
+        # 既然你指定了 CPU Faiss，通常模型也可能想省显存，我先默认 auto (库自己决定)
+        _emb_model = SentenceTransformer(real_model_path)
+    except Exception as e:
+        print(f"[RAG Error] 模型加载失败: {e}")
+        raise e
+
     print(f"[RAG] 初始化完成，index_ntotal={_index.ntotal}")
 
 
@@ -155,6 +198,10 @@ def retrieve_safety_docs(
         为 None 表示不过滤
     """
     _lazy_load()
+
+    # 如果索引没加载成功，直接返回空
+    if _index is None or _emb_model is None:
+        return []
 
     q = (query or "").strip()
     if not q:
@@ -303,40 +350,41 @@ def retrieve_relevant_docs(
         return []
 
     # ---- 语言选择 ----
-    lang = language_hint
-    if lang is None and router_ctx is not None:
-        lang_candidate = (router_ctx.get("lang") or "").lower()
-        if lang_candidate in {"zh", "en"}:
-            lang = lang_candidate
+    # 1. 准备参数
+    lang = language_hint or (router_ctx.get("lang") if router_ctx else None)
+    if lang not in ["zh", "en"]: lang = None # 默认不过滤
 
-    # ---- 风险标签 ----
-    tags_from_router = _map_router_to_risk_tags(router_ctx)
-    tags_from_focus = focus_risk or []
+    tags = set(_map_router_to_risk_tags(router_ctx))
+    if focus_risk: tags.update(focus_risk)
+    risk_tags = list(tags) if tags else None
 
-    risk_tags = list({*tags_from_router, *tags_from_focus})
-    if len(risk_tags) == 0:
-        # 实在推不出，就不按标签过滤
-        risk_tags = None
+    # 默认文档类型
+    doc_types = ["policy", "case", "template"] if mode == "input" else ["policy", "template", "case"]
 
-    # ---- 文档类型选择（你也可以按需改得更细，例如 input 侧更偏 policy）----
-    if mode == "input":
-        # 输入风险检测：更偏政策 + 典型案例
-        doc_types = ["policy", "case"]
-    elif mode == "output":
-        # 输出重写：政策 + 模板 + 案例都可以用
-        doc_types = ["policy", "template", "case"]
-    else:
-        doc_types = None  # 全部
-
+    # 2. 【第一轮】严格检索 (Strict Search)
+    # 要求：Risk Tags 必须匹配
     docs = retrieve_safety_docs(
-        query=query,
-        top_k=top_k,
-        doc_types=doc_types,
-        risk_tags=risk_tags,
-        language=lang,
+        query, top_k, doc_types=doc_types, risk_tags=risk_tags, language=lang
     )
-    return docs
 
+    # 3. 【第二轮】兜底检索 (Fallback Search) - 解决 0 命中问题
+    # 如果严格检索没结果，说明标签可能对不上（比如索引里没有 SELF_HARM 标签的文档）
+    # 此时去掉 risk_tags 限制，仅靠语义相似度搜索
+    if not docs and risk_tags:
+        print(f"[RAG Info] 严格标签检索({risk_tags})无结果，启用语义兜底检索...")
+        docs = retrieve_safety_docs(
+            query, top_k, doc_types=doc_types, risk_tags=None, language=lang
+        )
+
+    # 4. 【第三轮】终极兜底
+    # 如果还不行，去掉文档类型限制
+    if not docs:
+        print(f"[RAG Info] 启用全库语义检索兜底...")
+        docs = retrieve_safety_docs(
+            query, top_k, doc_types=None, risk_tags=None, language=lang
+        )
+
+    return docs
 
 # =========================
 # 新增：格式化 RAG 文档给 LLM 用
@@ -388,9 +436,13 @@ def format_docs_for_prompt(docs: List[Dict[str, Any]], max_chars: int = 4000) ->
 # =========================
 
 if __name__ == "__main__":
-    print(">>> 安全 RAG 简单测试（GPU 版 FAISS）")
+    print(">>> 安全 RAG 简单测试（CPU 版 FAISS 修复版）")
     while True:
-        q = input("Query> ").strip()
+        try:
+            q = input("Query> ").strip()
+        except EOFError:
+            break
+            
         if not q:
             break
 
