@@ -8,6 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from datetime import datetime
 import faiss
+
+"""
+调用方法：python apply_guard_to_pipeline.py   --input_detect_mode strict   --output_detect_mode normal   --enable_input_guard   --enable_output_guard
+"""
 """
 职责：干活。它负责跑通 Question -> InputGuard -> Model -> OutputGuard -> Rewrite 这一整套流程。
 支持针对 Input 和 Output 分别设置不同的检测粒度（strict, normal, lenient）。

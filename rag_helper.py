@@ -110,59 +110,53 @@ def _lazy_load() -> None:
         print(f"[RAG Error] 索引读取失败: {e}")
         return
 
-    # 2. 如配置为使用 GPU，则尝试转为 GPU index
-    if USE_FAISS_GPU:
+    if _emb_model is None:
+        real_model_path = os.path.expanduser(EMB_MODEL_NAME)
+        print(f"[RAG] 加载 embedding 模型 (GPU模式): {real_model_path}")
         try:
-            print(f"[RAG] 尝试使用 GPU 版本 FAISS (device={GPU_DEVICE_ID})...")
-            _gpu_res = faiss.StandardGpuResources()
-            _index = faiss.index_cpu_to_gpu(_gpu_res, GPU_DEVICE_ID, cpu_index)
-            print("[RAG] GPU 索引初始化成功")
+            # [Fix] 显式指定 device='cuda'，解决 accelerate 在 CPU 下的 meta tensor 报错
+            # 同时保留 trust_remote_code=True 以支持 bge-m3
+            _emb_model = SentenceTransformer(
+                real_model_path, 
+                device="cuda", 
+                trust_remote_code=True
+            )
         except Exception as e:
-            # 出现任何异常则回退到 CPU 版本
-            print(f"[RAG][WARN] GPU FAISS 初始化失败，将回退到 CPU 索引: {e}")
-            _index = cpu_index
-    else:
-        print("[RAG] 使用 CPU 版本 FAISS 进行检索")
-        _index = cpu_index
+            print(f"[RAG Error] GPU 模型加载失败: {e}")
+            # 只有在 GPU 失败时才尝试 CPU 降级
+            try:
+                print("[RAG] 尝试降级到 CPU 加载模型...")
+                _emb_model = SentenceTransformer(
+                    real_model_path, 
+                    device="cpu", 
+                    trust_remote_code=True
+                )
+            except Exception as e2:
+                print(f"[RAG Fatal] 模型最终加载失败: {e2}")
+                return
 
-    # 3. 加载 docs 列表
-    print(f"[RAG] 加载文档元信息: {DOCS_JSONL_PATH}")
-    _docs.clear()
-    try:
-        with DOCS_JSONL_PATH.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    _docs.append(obj)
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        print(f"[RAG Error] 文档加载失败: {e}")
+    # 3. 加载 索引
+    if _index is None:
+        print(f"[RAG] 从磁盘读取 CPU 索引: {INDEX_PATH}")
+        try:
+            _index = faiss.read_index(str(INDEX_PATH))
+        except Exception as e:
+            print(f"[RAG Error] 索引读取失败: {e}")
+            return
 
-    print(f"[RAG] 文档总数: {len(_docs)}")
-
-    # 4. 加载向量模型
-    # [Fix] 关键修复：展开用户路径 (~)
-    real_model_path = os.path.expanduser(EMB_MODEL_NAME)
-    print(f"[RAG] 加载 embedding 模型: {real_model_path}")
-    
-    if SentenceTransformer is None:
-        raise ImportError("缺少 sentence_transformers 库，无法加载模型。")
-
-    try:
-        # device='cpu' 确保模型也跑在 CPU 上，如果想让 Embedding 跑 GPU，可以改为 'cuda'
-        # 这里为了稳妥起见，如果你想要纯 CPU 环境，用 'cpu'；如果你有显卡想加速模型计算，用 'cuda'
-        # 既然你指定了 CPU Faiss，通常模型也可能想省显存，我先默认 auto (库自己决定)
-        _emb_model = SentenceTransformer(real_model_path)
-    except Exception as e:
-        print(f"[RAG Error] 模型加载失败: {e}")
-        raise e
-
-    print(f"[RAG] 初始化完成，index_ntotal={_index.ntotal}")
-
+    # 4. 加载 文档元数据
+    if not _docs:
+        print(f"[RAG] 加载文档列表: {DOCS_JSONL_PATH}")
+        try:
+            with DOCS_JSONL_PATH.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            _docs.append(json.loads(line))
+                        except: pass
+            print(f"[RAG] 文档加载完成，共 {len(_docs)} 条")
+        except Exception as e:
+            print(f"[RAG Error] 文档加载失败: {e}")
 
 # =========================
 # 底层接口：按 meta 过滤的检索
