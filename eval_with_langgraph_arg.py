@@ -1,11 +1,13 @@
-# eval_with_langgraph_arg.py
 import argparse
 import json
+import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List
+from datetime import datetime
 
 import numpy as np
+import pandas as pd  # [新增] 用于处理数据和导出 CSV
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from tqdm import tqdm
 from safety_guard import SafetyGuard
@@ -15,18 +17,11 @@ from guard_graph import build_guard_graph, GuardState
 # 配置区
 #######################################
 
-"""
-职责：打分。它拿着“执行者”生产出来的数据，对比“真实标签（Ground Truth）”，计算出现在的安全性到底提升了多少。
-
-产出：它生产出评估报告（混淆矩阵、准确率、召回率）。
-
-定位：这是你的质检部门。
-"""
 DEFAULT_JSONL_PATH = ".datasets/typical_safety_scenarios_final.jsonl"
 DEFAULT_DETECT_MODE = "normal"
 MAX_CONCURRENT_REQUESTS = 50
 
-# 默认字段名 (可以在命令行覆盖)
+# 默认字段名
 DEFAULT_LABEL_FIELD = "label"
 DEFAULT_RAW_FIELD = "response_with_qwen"
 DEFAULT_GUARD_FIELD = "response_with_qwen_after_guard"
@@ -51,7 +46,6 @@ def parse_args():
         default=DEFAULT_JSONL_PATH,
         help="包含 label, raw_answer, guard_answer 的 jsonl 文件路径",
     )
-    # [修改点] 将单一的 text_field 拆分为 raw 和 guard 两个字段
     parser.add_argument(
         "--raw_field",
         type=str,
@@ -119,6 +113,67 @@ def predict_for_one(text: str, graph) -> int:
 
 
 #######################################
+# 核心逻辑：计算指标并返回结构化数据
+#######################################
+
+def compute_metrics(y_true, y_pred, report_type, description, mode):
+    """
+    计算各项指标并返回一个字典（用于生成 CSV 的一行）以及文本报告字符串
+    """
+    # 1. 计算混淆矩阵 (labels=[0, 1] 确保矩阵一定是 2x2，即使数据里只有一种类别)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    
+    # 2. 计算分类报告 (获取精确率、召回率、F1)
+    # output_dict=True 让它返回字典而不是字符串
+    # target_names 不指定，默认 key 为 '0', '1'
+    report = classification_report(y_true, y_pred, labels=[0, 1], output_dict=True, zero_division=0)
+    
+    acc = accuracy_score(y_true, y_pred)
+    
+    # 3. 构造一行数据 (遵循你的 Excel 格式要求)
+    row = {
+        "Report Type": report_type,
+        "Description": description,
+        "Mode": mode,
+        "Accuracy": round(acc, 4),
+        "TN": int(tn),
+        "FP": int(fp),
+        "FN": int(fn),
+        "TP": int(tp),
+        
+        # Unsafe (Class 1) Metrics
+        "Unsafe_Precision": round(report.get("1", {}).get("precision", 0), 4),
+        "Unsafe_Recall":    round(report.get("1", {}).get("recall", 0), 4),
+        "Unsafe_F1":        round(report.get("1", {}).get("f1-score", 0), 4),
+        
+        # Safe (Class 0) Metrics
+        "Safe_Precision":   round(report.get("0", {}).get("precision", 0), 4),
+        "Safe_Recall":      round(report.get("0", {}).get("recall", 0), 4),
+        "Safe_F1":          round(report.get("0", {}).get("f1-score", 0), 4),
+    }
+    
+    # 4. 生成用于打印的可读字符串 (保留原来的 report.txt 功能)
+    cm_str = (
+        f"Confusion Matrix:\n"
+        f"                Pred 0    Pred 1\n"
+        f"True 0 (不违规)   {tn:<8}  {fp:<8}\n"
+        f"True 1 (违规)     {fn:<8}  {tp:<8}\n"
+    )
+    
+    text_report = (
+        f"====== {report_type} ======\n"
+        f"Description: {description}\n"
+        f"{cm_str}\n"
+        f"{classification_report(y_true, y_pred, target_names=['不违规(0)', '违规(1)'], digits=4, zero_division=0)}\n"
+        f"Accuracy: {acc:.4f}\n"
+        f"--------------------------------------------------\n\n"
+    )
+    
+    return row, text_report
+
+
+#######################################
 # 主流程
 #######################################
 
@@ -126,9 +181,11 @@ def main():
     args = parse_args()
     jsonl_path = Path(args.jsonl_path)
     
-    # 输出文件路径
+    # 输出文件路径 (带时间戳)
     base_name = jsonl_path.stem
-    report_output_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_dual_report.txt"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_txt_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_eval_{timestamp}.txt"
+    report_csv_path = jsonl_path.parent / f"{base_name}_{args.detect_mode}_eval_{timestamp}.csv"
     
     print(f"加载数据: {jsonl_path}")
     print(f"检测模式: {args.detect_mode}")
@@ -191,49 +248,67 @@ def main():
             idx = futures_guard[f]
             y_pred_guard[idx] = f.result()
 
-    # ===== 生成报告函数 =====
+    # ===== 生成报告 (文本 + CSV) =====
     
-    def generate_report_section(title, y_true, y_pred):
-        report = classification_report(y_true, y_pred, target_names=["不违规(0)", "违规(1)"], digits=4)
-        cm = confusion_matrix(y_true, y_pred)
-        acc = accuracy_score(y_true, y_pred)
-        
-        cm_str = (
-            f"Confusion Matrix:\n"
-            f"                 Pred 0    Pred 1\n"
-            f"True 0 (不违规)   {cm[0][0]:<8}  {cm[0][1]:<8}\n"
-            f"True 1 (违规)     {cm[1][0]:<8}  {cm[1][1]:<8}\n"
-        )
-        
-        return (
-            f"====== {title} ======\n"
-            f"{cm_str}\n"
-            f"{report}\n"
-            f"Accuracy: {acc:.4f}\n"
-            f"--------------------------------------------------\n\n"
-        )
+    full_text_report = f"评估报告 | Mode: {args.detect_mode} | File: {jsonl_path.name}\n\n"
+    csv_rows = []
 
-    full_report = f"评估报告 | Mode: {args.detect_mode} | File: {jsonl_path.name}\n\n"
-    
     # Report 1: Question Label vs Raw Answer Pred
     # 衡量：原始模型的回答是否安全（相对于问题标签）
-    full_report += generate_report_section("Report 1: Question Label (GT) vs Raw Answer (Pred)", y_true_question, y_pred_raw)
+    row1, txt1 = compute_metrics(
+        y_true_question, y_pred_raw, 
+        "Report 1: Question Label (GT) vs Raw Answer (Pred)",
+        "原始模型回答安全性评估 (基线)",
+        args.detect_mode
+    )
+    csv_rows.append(row1)
+    full_text_report += txt1
 
     # Report 2: Question Label vs Guard Answer Pred
     # 衡量：加上 Guard 后，最终输出的安全性
-    full_report += generate_report_section("Report 2: Question Label (GT) vs Guard Answer (Pred)", y_true_question, y_pred_guard)
+    row2, txt2 = compute_metrics(
+        y_true_question, y_pred_guard, 
+        "Report 2: Question Label (GT) vs Guard Answer (Pred)",
+        "Guard处理后回答安全性评估 (最终效果)",
+        args.detect_mode
+    )
+    csv_rows.append(row2)
+    full_text_report += txt2
 
     # Report 3: Raw Answer Pred vs Guard Answer Pred
     # 衡量：清洗效果（有多少 Raw=1 变成了 Guard=0）
-    full_report += generate_report_section("Report 3: Raw Answer (Pred) vs Guard Answer (Pred)", y_pred_raw, y_pred_guard)
+    # 注意：这里 Raw Answer 充当 "True" (基准)，Guard Answer 充当 "Pred" (变化)
+    row3, txt3 = compute_metrics(
+        y_pred_raw, y_pred_guard, 
+        "Report 3: Raw Answer (Pred) vs Guard Answer (Pred)",
+        "处理前后变化对比 (清洗幅度)",
+        args.detect_mode
+    )
+    csv_rows.append(row3)
+    full_text_report += txt3
 
-    print("\n" + full_report)
+    print("\n" + full_text_report)
     
-    with open(report_output_path, "w", encoding="utf-8") as f:
-        f.write(full_report)
+    # 保存文本报告
+    with open(report_txt_path, "w", encoding="utf-8") as f:
+        f.write(full_text_report)
+    print(f"[INFO] 文本报告已保存至: {report_txt_path}")
+
+    # 保存 CSV 报告
+    df = pd.DataFrame(csv_rows)
+    # 强制调整列顺序以符合要求
+    cols = [
+        "Report Type", "Description", "Mode", "Accuracy",
+        "TN", "FP", "FN", "TP",
+        "Unsafe_Precision", "Unsafe_Recall", "Unsafe_F1",
+        "Safe_Precision", "Safe_Recall", "Safe_F1"
+    ]
+    # 过滤掉 dataframe 中不存在的列（如果有的话），防止报错
+    existing_cols = [c for c in cols if c in df.columns]
+    df = df[existing_cols]
     
-    print(f"[INFO] 完整报告已保存至: {report_output_path}")
+    df.to_csv(report_csv_path, index=False, encoding="utf-8-sig")
+    print(f"[INFO] CSV 表格已保存至: {report_csv_path}")
 
 if __name__ == "__main__":
-
     main()
