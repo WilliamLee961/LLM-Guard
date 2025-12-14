@@ -57,10 +57,10 @@ EMB_MODEL_NAME = "~/bge-m3"
 
 # 是否使用 GPU 版本 FAISS
 # [Fix] 强制改为 False，满足你的 CPU 需求
-USE_FAISS_GPU = False  
+USE_FAISS_GPU = True
 
 # 使用哪块 GPU（多卡机器时可调整）
-GPU_DEVICE_ID = 0
+GPU_DEVICE_ID = 2
 
 # =========================
 # 全局懒加载句柄
@@ -103,7 +103,7 @@ def _lazy_load() -> None:
         return
 
     # 1. 读取 CPU index
-    print(f"[RAG] 从磁盘读取 CPU 索引: {INDEX_PATH}")
+    print(f"[RAG] 从磁盘读取 GPU 索引: {INDEX_PATH}")
     try:
         cpu_index = faiss.read_index(str(INDEX_PATH))
     except Exception as e:
@@ -128,7 +128,7 @@ def _lazy_load() -> None:
                 print("[RAG] 尝试降级到 CPU 加载模型...")
                 _emb_model = SentenceTransformer(
                     real_model_path, 
-                    device="cpu", 
+                    device="gpu", 
                     trust_remote_code=True
                 )
             except Exception as e2:
@@ -137,7 +137,7 @@ def _lazy_load() -> None:
 
     # 3. 加载 索引
     if _index is None:
-        print(f"[RAG] 从磁盘读取 CPU 索引: {INDEX_PATH}")
+        print(f"[RAG] 从磁盘读取 GPU 索引: {INDEX_PATH}")
         try:
             _index = faiss.read_index(str(INDEX_PATH))
         except Exception as e:

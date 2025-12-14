@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument("--enable_output_guard", action="store_true", default=True)
     parser.add_argument("--disable_output_guard", action="store_false", dest="enable_output_guard")
     
-    parser.add_argument("--use_rag", action="store_true", default=False)
+    parser.add_argument("--use_rag", action="store_true", default=True)
     parser.add_argument("--max_workers", type=int, default=MAX_WORKERS)
     
     return parser.parse_args()
