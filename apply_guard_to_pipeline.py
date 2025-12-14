@@ -39,7 +39,7 @@ except ImportError as e:
 DEFAULT_INPUT_PATH = "/home/lijiahang/MY_GUARD/results/results_en/simply_Qwen_answer_strict_total.jsonl"
 DEFAULT_DETECT_MODE = "normal"
 DEFAULT_TARGET_FIELD = "response_with_qwen" 
-MAX_WORKERS = 50
+MAX_WORKERS = 32
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Guard 治理模式 v3.1: 独立粒度全流程防护")
@@ -210,11 +210,15 @@ def main():
         if not base_dir: base_dir = "."
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # 文件名体现双模式配置
-        if in_mode == out_mode:
-            mode_str = in_mode
+        # [修改点] 文件名体现双模式配置，且体现是否禁用
+        # 如果对应的 Guard 被禁用，模式名替换为 "None"
+        file_in_mode = in_mode if args.enable_input_guard else "None"
+        file_out_mode = out_mode if args.enable_output_guard else "None"
+        
+        if file_in_mode == file_out_mode:
+            mode_str = file_in_mode
         else:
-            mode_str = f"in_{in_mode}_out_{out_mode}"
+            mode_str = f"in_{file_in_mode}_out_{file_out_mode}"
             
         filename = f"Guard_FullPipeline_{mode_str}_{timestamp}.jsonl"
         args.output_path = os.path.join(base_dir, filename)
@@ -227,6 +231,8 @@ def main():
     output_guard = None
 
     # 优化资源：如果模式相同，只实例化一个 Guard 对象复用
+    # 注意：这里依然使用 in_mode/out_mode 来初始化对象，即使该 Guard 可能被禁用。
+    # 禁用逻辑在 process_line 中通过 enable_input/output 开关控制。
     if in_mode == out_mode:
         print(f"Modes are identical ({in_mode}). Sharing single SafetyGuard instance.")
         shared_guard = SafetyGuard(detect_mode=in_mode, use_rag=args.use_rag, enabled=True)
