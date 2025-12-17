@@ -12,7 +12,7 @@ from tqdm import tqdm
 # 配置区：按你的数据修改
 #######################################
 
-JSONL_PATH = "/home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_in_strict_out_normal_20251215_111638.jsonl"
+JSONL_PATH = "/home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_normal_20251215_143501.jsonl"
 
 # 真实标签字段名
 LABEL_FIELD = "label"
