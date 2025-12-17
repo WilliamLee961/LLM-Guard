@@ -36,7 +36,7 @@ except ImportError as e:
 # 2. 配置与业务逻辑
 # ==============================================================================
 
-DEFAULT_INPUT_PATH = "/home/lijiahang/MY_GUARD/results/results_en/simply_Qwen_answer_strict_total.jsonl"
+DEFAULT_INPUT_PATH = "/home/lijiahang/MY_GUARD/results/results_chinesesafe/simply_Qwen_answer.jsonl"
 DEFAULT_DETECT_MODE = "normal"
 DEFAULT_TARGET_FIELD = "response_with_qwen" 
 MAX_WORKERS = 32
@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument("--enable_output_guard", action="store_true", default=True)
     parser.add_argument("--disable_output_guard", action="store_false", dest="enable_output_guard")
     
-    parser.add_argument("--use_rag", action="store_true", default=True)
+    parser.add_argument("--use_rag", action="store_true", default=False)
     parser.add_argument("--max_workers", type=int, default=MAX_WORKERS)
     
     return parser.parse_args()
@@ -215,10 +215,8 @@ def main():
         file_in_mode = in_mode if args.enable_input_guard else "None"
         file_out_mode = out_mode if args.enable_output_guard else "None"
         
-        if file_in_mode == file_out_mode:
-            mode_str = file_in_mode
-        else:
-            mode_str = f"in_{file_in_mode}_out_{file_out_mode}"
+
+        mode_str = f"in_{file_in_mode}_out_{file_out_mode}_rag_{args.use_rag}"
             
         filename = f"Guard_FullPipeline_{mode_str}_{timestamp}.jsonl"
         args.output_path = os.path.join(base_dir, filename)
