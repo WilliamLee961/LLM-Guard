@@ -1,0 +1,6 @@
+python eval_with_deepseek_arg.py --jsonl_path /home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_in_normal_out_normal_rag_True_20251217_073115.jsonl
+python eval_with_deepseek_arg.py --jsonl_path /home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_in_normal_out_strict_rag_True_20251217_083044.jsonl
+python eval_with_deepseek_arg.py --jsonl_path /home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_in_strict_out_normal_rag_True_20251217_063314.jsonl
+python eval_with_deepseek_arg.py --jsonl_path /home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_in_strict_out_strict_rag_True_20251217_095353.jsonl
+
+# python eval_with_deepseek_arg_GA.py --jsonl_path /home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_normal_20251215_123909_inout_guard_with_file_resp.jsonl
