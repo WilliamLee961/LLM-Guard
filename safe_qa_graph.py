@@ -104,7 +104,7 @@ def risk_input_node_factory(difficulty: str = "normal"):
             q,
             router_ctx,
             mode="input",
-            use_rag_on_uncertain=False,
+            use_rag_on_uncertain=True,
         )
         state["input_risk_profile"] = risk_profile
 
@@ -163,7 +163,7 @@ def risk_output_node_factory(difficulty: str = "normal"):
             ans,
             router_ctx,
             mode="output",
-            use_rag_on_uncertain=False,
+            use_rag_on_uncertain=True,
         )
         state["output_risk_profile"] = risk_profile
 

@@ -36,7 +36,7 @@ except ImportError as e:
 # 2. 配置与业务逻辑
 # ==============================================================================
 
-DEFAULT_INPUT_PATH = "/home/lijiahang/MY_GUARD/results/results_chinesesafe/simply_Qwen_answer.jsonl"
+DEFAULT_INPUT_PATH = "/home/lijiahang/MY_GUARD/results/results_en/Guard_FullPipeline_normal_20251215_123909.jsonl"
 DEFAULT_DETECT_MODE = "normal"
 DEFAULT_TARGET_FIELD = "response_with_qwen" 
 MAX_WORKERS = 32
