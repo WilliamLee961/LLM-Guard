@@ -1,3 +1,5 @@
 results/
 datasets/
 safety_knowledge/
+__pycache__/
+*.pyc
