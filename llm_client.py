@@ -1,5 +1,6 @@
 # llm_client.py
 import json
+import os
 import re
 from typing import Dict, Any, List, Optional
 
@@ -10,13 +11,18 @@ from openai import OpenAI
 # OpenAI 兼容客户端配置
 # =========================
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "EMPTY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://100.87.153.109:8000/v1")
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "60"))
+
 client = OpenAI(
-    api_key="EMPTY",                 # 本地/代理一般忽略
-    base_url="http://100.87.153.109:8000/v1",  # 改成你自己的服务地址 8000 4B,  8001 0.5B
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL,
+    timeout=OPENAI_TIMEOUT,
 )
 
 # 你实际用的模型名字：
-MODEL_NAME = "Qwen"  # 或者 "models/Qwen3-4B-Instruct-2507" 等
+MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "Qwen")
 
 
 # =========================
