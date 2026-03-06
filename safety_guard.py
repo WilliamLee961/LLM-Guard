@@ -8,6 +8,11 @@ from guard_graph import build_guard_graph, GuardState
 from safe_qa_graph import safe_answer_node, QAState
 from routing_hub import analyze_query
 from risk_hub import detect_risk_discrete
+from response_policy import (
+    render_fallback_safe_response,
+    rewrite_query_for_safe_mode,
+    select_response_action,
+)
 import faiss
 
 class SafetyGuard:
@@ -63,6 +68,7 @@ class SafetyGuard:
             result = self.detect_graph.invoke(state)
             violation = int(result.get("pred_violation", 0))
             risk_profile = result.get("risk_profile", {})
+            router_ctx = result.get("router_ctx", {})
         except Exception as e:
             print(f"[Guard Error] 检测失败: {e}")
             # 出错时默认放行，或者你可以选择默认阻断
@@ -71,14 +77,40 @@ class SafetyGuard:
         # 3. 如果判定安全 (0)，放行
         if violation == 0:
             return True, question, {"risk_profile": risk_profile, "action": "pass"}
+
+        strategy = select_response_action(
+            stage="input",
+            difficulty=self.detect_mode,
+            input_risk_profile=risk_profile,
+            output_risk_profile={},
+            router_ctx_in=router_ctx,
+            router_ctx_out={},
+        )
+        strategy_action = str(strategy.get("action", "SAFE_ANSWER")).upper()
+
+        # 3.1 允许“输入改写后放行”：提升 strict/normal 的可用性
+        if strategy_action in {"ALLOW", "REWRITE"}:
+            rewritten_query = rewrite_query_for_safe_mode(question, strategy)
+            return True, rewritten_query, {
+                "risk_profile": risk_profile,
+                "action": "rewrote_input_query" if strategy_action == "REWRITE" else "pass",
+                "response_strategy": strategy,
+                "rewritten_query": rewritten_query,
+            }
         
         # 4. 如果判定违规 (1)，生成拒答/代答
         print(f"[Guard] 拦截到不安全提问，正在生成拒绝回复...")
-        safe_response = self._generate_safe_response(question, source_type="input")
+        safe_response, response_strategy = self._generate_safe_response(
+            question,
+            source_type="input",
+            input_risk_profile=risk_profile,
+        )
+        strategy_action = str(response_strategy.get("action", "SAFE_ANSWER")).lower()
         
         return False, safe_response, {
             "risk_profile": risk_profile, 
-            "action": "blocked_input",
+            "action": f"blocked_input_{strategy_action}",
+            "response_strategy": response_strategy,
             "original_query": question
         }
 
@@ -115,19 +147,30 @@ class SafetyGuard:
 
         # 4. 如果违规，进行安全重写
         print(f"[Guard] 拦截到不安全回答，正在进行重写...")
-        safe_rewrite = self._generate_safe_response(
+        safe_rewrite, response_strategy = self._generate_safe_response(
             question, 
             source_type="output", 
-            unsafe_response=response
+            unsafe_response=response,
+            output_risk_profile=risk_profile,
         )
+        strategy_action = str(response_strategy.get("action", "REWRITE")).lower()
+        output_action = "rewrote_output" if strategy_action == "rewrite" else f"replaced_output_{strategy_action}"
         
         return False, safe_rewrite, {
             "risk_profile": risk_profile, 
-            "action": "rewrote_output",
+            "action": output_action,
+            "response_strategy": response_strategy,
             "original_response": response
         }
 
-    def _generate_safe_response(self, question: str, source_type: str, unsafe_response: str = "") -> str:
+    def _generate_safe_response(
+        self,
+        question: str,
+        source_type: str,
+        unsafe_response: str = "",
+        input_risk_profile: Optional[Dict[str, Any]] = None,
+        output_risk_profile: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
         """
         内部方法：调用 SafeQA Graph 生成高质量的安全回复。
         """
@@ -149,6 +192,11 @@ class SafetyGuard:
                 
                 "router_ctx_in": router_ctx_in,
                 "router_ctx_out": router_ctx_out,
+                "guard_stage": source_type,
+                "input_risk_profile": input_risk_profile or {},
+                "output_risk_profile": output_risk_profile or {},
+                "input_violation": 1 if source_type == "input" else 0,
+                "output_violation": 1 if source_type == "output" else 0,
                 
                 # 传入 RAG 开关
                 "use_rag": self.use_rag
@@ -157,9 +205,27 @@ class SafetyGuard:
             # 3. 调用 safe_answer_node 生成回复
             # 注意：这里直接调用 node 函数，而不是 invoke 整个 graph，节省开销
             result_state = safe_answer_node(state)
-            return result_state.get("final_answer", "很抱歉，我无法回答该问题。")
+            return (
+                result_state.get("final_answer", "很抱歉，我无法回答该问题。"),
+                result_state.get("response_strategy", {}),
+            )
 
         except Exception as e:
             print(f"[Guard Error] 生成安全代答失败: {e}")
-            # 降级兜底回复
-            return "很抱歉，作为一个人工智能助手，我不能生成可能涉及风险的内容。请遵守相关法律法规。"
+            strategy = select_response_action(
+                stage=source_type,
+                difficulty=self.detect_mode,
+                input_risk_profile=input_risk_profile or {},
+                output_risk_profile=output_risk_profile or {},
+                router_ctx_in=analyze_query(question),
+                router_ctx_out=analyze_query(unsafe_response) if unsafe_response else {},
+            )
+            risk_profile = output_risk_profile if source_type == "output" else input_risk_profile
+            fallback = render_fallback_safe_response(
+                query=question,
+                strategy=strategy,
+                risk_profile=risk_profile or {},
+                stage=source_type,
+                original_answer=unsafe_response,
+            )
+            return fallback, strategy

@@ -5,9 +5,14 @@ from langgraph.graph import StateGraph, END
 
 from routing_hub import analyze_query
 from risk_hub import detect_risk_discrete
-from guard_graph import is_predicted_violation
 from llm_client import llm_chat
 from rag_helper import retrieve_relevant_docs, format_docs_for_prompt
+from response_policy import (
+    is_low_quality_safe_answer,
+    render_fallback_safe_response,
+    rewrite_query_for_safe_mode,
+    select_response_action,
+)
 import faiss
 
 class QAState(TypedDict, total=False):
@@ -41,6 +46,9 @@ class QAState(TypedDict, total=False):
     rag_docs: List[Dict[str, Any]]
     final_answer: str
     use_rag: bool  # 状态中携带开关
+    guard_stage: str
+    response_strategy: Dict[str, Any]
+    rewritten_user_query: str
 
 
 # =========================
@@ -108,14 +116,29 @@ def risk_input_node_factory(difficulty: str = "normal"):
         )
         state["input_risk_profile"] = risk_profile
 
-        pred = is_predicted_violation(risk_profile, mode=difficulty)
-        state["input_violation"] = pred
+        strategy = select_response_action(
+            stage="input",
+            difficulty=difficulty,
+            input_risk_profile=risk_profile,
+            output_risk_profile={},
+            router_ctx_in=router_ctx,
+            router_ctx_out={},
+        )
+        state["response_strategy"] = strategy
+        action = str(strategy.get("action", "ALLOW")).upper()
+        state["input_violation"] = 1 if action in {"SAFE_ANSWER", "REFUSE", "ESCALATE"} else 0
         return state
 
     return risk_input_node
 
 
 def input_decision_node(state: QAState) -> QAState:
+    strategy = state.get("response_strategy") or {}
+    if str(strategy.get("action", "ALLOW")).upper() == "REWRITE":
+        state["rewritten_user_query"] = rewrite_query_for_safe_mode(
+            state.get("user_query", ""),
+            strategy,
+        )
     return state
 
 
@@ -124,7 +147,7 @@ def main_answer_node(state: QAState) -> QAState:
     主回答模型节点：
       - 对输入侧判定为“不违规”的问题，用主模型正常回答。
     """
-    q = state.get("user_query", "")
+    q = state.get("rewritten_user_query", "") or state.get("user_query", "")
 
     system_prompt = (
         "你是一个乐于助人的中文问答助手，需要在保证安全、合法、"
@@ -167,8 +190,17 @@ def risk_output_node_factory(difficulty: str = "normal"):
         )
         state["output_risk_profile"] = risk_profile
 
-        pred = is_predicted_violation(risk_profile, mode=difficulty)
-        state["output_violation"] = pred
+        strategy = select_response_action(
+            stage="output",
+            difficulty=difficulty,
+            input_risk_profile=state.get("input_risk_profile") or {},
+            output_risk_profile=risk_profile,
+            router_ctx_in=state.get("router_ctx_in") or {},
+            router_ctx_out=router_ctx,
+        )
+        state["response_strategy"] = strategy
+        action = str(strategy.get("action", "ALLOW")).upper()
+        state["output_violation"] = 0 if action == "ALLOW" else 1
         return state
 
     return risk_output_node
@@ -181,13 +213,35 @@ def output_decision_node(state: QAState) -> QAState:
 def safe_answer_node(state: QAState) -> QAState:
     """
     【核心】生成安全回复 / 拒答 / 重写
-    这里集成 RAG：检索安全政策和话术，辅助生成。
+    基于 chapter-3 响应决策策略（ALLOW/REWRITE/SAFE_ANSWER/REFUSE/ESCALATE）
+    结合风险分层与难度模式，提升安全回复的可用性和可执行性。
     """
     q = state.get("user_query", "")
     orig_answer = state.get("model_answer", "")
     input_risk = state.get("input_risk_profile", {}) or {}
     output_risk = state.get("output_risk_profile", {}) or {}
     router_ctx_in = state.get("router_ctx_in") or {}
+    router_ctx_out = state.get("router_ctx_out") or {}
+    difficulty = state.get("difficulty", "normal")
+
+    guard_stage = state.get("guard_stage")
+    if not guard_stage:
+        if state.get("output_violation", 0) == 1:
+            guard_stage = "output"
+        elif state.get("input_violation", 0) == 1:
+            guard_stage = "input"
+        else:
+            guard_stage = "output" if orig_answer else "input"
+
+    strategy = select_response_action(
+        stage=guard_stage,
+        difficulty=difficulty,
+        input_risk_profile=input_risk,
+        output_risk_profile=output_risk,
+        router_ctx_in=router_ctx_in,
+        router_ctx_out=router_ctx_out,
+    )
+    state["response_strategy"] = strategy
 
     # 获取 RAG 开关状态，默认为 False (不开启)
     use_rag = state.get("use_rag", False)
@@ -217,17 +271,20 @@ def safe_answer_node(state: QAState) -> QAState:
 
     # ---------- 构造提示 ----------
     system_prompt = (
-        "你是一个内容安全和合规方面的智能助手，需要在保证用户安全、"
-        "遵守法律法规和主流伦理价值观的前提下，对用户的问题给出一个"
-        "既安全又尽可能有用的回答。"
-        "对于违法犯罪、自残自杀、暴力伤害、隐私泄露等高风险请求，"
-        "你应该拒绝提供具体操作方法，并进行温和劝阻和风险提示，"
-        "可以提供安全的替代方案或求助途径。"
+        "你是“安全围栏响应决策模块”的执行助手。目标不是只拒答，而是："
+        "在不输出危险细节的前提下，尽可能保留帮助性和任务可用性。"
+        "你必须遵循 action 策略："
+        "REWRITE=保留合法信息并重写危险段；"
+        "SAFE_ANSWER=给出安全替代方案；"
+        "REFUSE=明确拒绝并给替代路径；"
+        "ESCALATE=优先现实安全建议与求助路径。"
     )
 
     user_prompt_parts: List[str] = []
 
     user_prompt_parts.append(f"【用户原始问题】\n{q}\n")
+    user_prompt_parts.append(f"【当前处理阶段】\n{guard_stage}\n")
+    user_prompt_parts.append(f"【决策策略】\n{strategy}\n")
 
     if orig_answer:
         user_prompt_parts.append(
@@ -244,31 +301,49 @@ def safe_answer_node(state: QAState) -> QAState:
         f"{output_risk}\n"
     )
 
-    # 无论是否启用 RAG，这里都会把 docs_text 拼进去
-    # 如果禁用 RAG，docs_text 会是默认的提示语（如“未检索到相关资料...”）
     user_prompt_parts.append(
         "【与安全相关的参考文档（RAG 检索结果）】\n"
         f"{docs_text}\n"
     )
 
-    user_prompt_parts.append(
-        "请你综合以上信息，给出一个安全、合规、温和且有帮助的回答：\n"
-        "  - 不要提供任何违法犯罪、自残自杀、暴力伤害、隐私泄露、"
-        "    高风险金融、恐怖主义等具体操作细节；\n"
-        "  - 可以解释为什么这些行为有风险；\n"
-        "  - 可以建议用户寻求专业帮助（如心理医生、官方渠道）；\n"
-        "  - 对于比较正常但有争议的话题，给出中立、负责任的解释。\n"
-        "请用中文回答。"
-    )
+    if strategy.get("action") == "REWRITE":
+        user_prompt_parts.append(
+            "请执行“安全改写”，输出一份可直接给用户的最终回答：\n"
+            "1) 保留原回答中合法且有用的信息；\n"
+            "2) 删除或替换危险细节（违法、伤害、越狱、欺诈等）；\n"
+            "3) 给出2-4条可执行的合规替代步骤；\n"
+            "4) 语言自然，不要只说套话，不要空泛道歉。\n"
+            "请直接输出最终文本，不要解释你的改写过程。"
+        )
+    else:
+        user_prompt_parts.append(
+            "请执行“安全代答/拒答”，输出一份高帮助性的最终回答：\n"
+            "1) 先用1句话说明风险边界；\n"
+            "2) 给出2-4条可执行替代方案（必须可落地）；\n"
+            "3) 给出下一步建议（必要时提示求助渠道）；\n"
+            "4) 不得输出可直接执行的危险细节；\n"
+            "5) 不要只有‘我不能回答’，必须提供建设性替代。\n"
+            "请直接输出最终文本。"
+        )
 
     user_prompt = "\n\n".join(user_prompt_parts)
 
     safe_answer = llm_chat(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        temperature=0.3,
+        temperature=0.2,
         max_tokens=1024,
     )
+
+    effective_profile = output_risk if guard_stage == "output" else input_risk
+    if is_low_quality_safe_answer(safe_answer):
+        safe_answer = render_fallback_safe_response(
+            query=q,
+            strategy=strategy,
+            risk_profile=effective_profile,
+            stage=guard_stage,
+            original_answer=orig_answer,
+        )
 
     state["final_answer"] = safe_answer
     return state
@@ -276,6 +351,12 @@ def safe_answer_node(state: QAState) -> QAState:
 
 def finalize_answer_node(state: QAState) -> QAState:
     state["final_answer"] = state.get("model_answer", "") or ""
+    if "response_strategy" not in state:
+        state["response_strategy"] = {
+            "action": "ALLOW",
+            "stage": "output",
+            "overall_risk_level": (state.get("output_risk_profile") or {}).get("overall_risk_level", "L1"),
+        }
     return state
 
 
@@ -284,14 +365,18 @@ def finalize_answer_node(state: QAState) -> QAState:
 # =========================
 
 def input_route_fn(state: QAState) -> str:
-    if state.get("input_violation", 0) == 1:
+    strategy = state.get("response_strategy") or {}
+    action = str(strategy.get("action", "ALLOW")).upper()
+    if action in {"SAFE_ANSWER", "REFUSE", "ESCALATE"}:
         return "safe_answer"
     else:
         return "main_answer"
 
 
 def output_route_fn(state: QAState) -> str:
-    if state.get("output_violation", 0) == 1:
+    strategy = state.get("response_strategy") or {}
+    action = str(strategy.get("action", "ALLOW")).upper()
+    if action != "ALLOW":
         return "safe_answer"
     else:
         return "finalize_answer"

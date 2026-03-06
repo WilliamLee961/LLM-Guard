@@ -37,6 +37,7 @@ function collectRisks(profile) {
 function renderGuardBlock(container, data, title) {
   const pred = Number(data?.pred_violation || 0);
   const profile = data?.risk_profile || {};
+  const strategy = data?.response_strategy || {};
   const risks = collectRisks(profile);
   const violationClass = pred === 1 ? "violation-blocked" : "violation-pass";
   const violationText = pred === 1 ? "触发拦截" : "通过";
@@ -52,6 +53,7 @@ function renderGuardBlock(container, data, title) {
     <div><strong>${escapeHtml(title)}</strong></div>
     <div>违规判定：<span class="${violationClass}">${violationText}</span></div>
     <div>整体等级：${escapeHtml(profile?.overall_risk_level || "L1")}</div>
+    <div>决策动作：${escapeHtml(strategy?.action || "ALLOW")}</div>
     <div class="risk-tag-wrap">${riskTags}</div>
     <details style="margin-top:8px;">
       <summary>查看 router_ctx</summary>
@@ -67,6 +69,7 @@ function renderGuardBlock(container, data, title) {
 function renderSummary(result) {
   const blocked = result?.blocked_stage || "none";
   const fallback = result?.used_fallback ? "yes" : "no";
+  const strategyAction = result?.response_strategy?.action || "ALLOW";
   summaryEl.innerHTML = `
     <div class="metric">
       <span class="label">请求引擎</span>
@@ -83,6 +86,10 @@ function renderSummary(result) {
     <div class="metric">
       <span class="label">处理动作</span>
       <span class="value">${escapeHtml(result?.action || "-")}</span>
+    </div>
+    <div class="metric">
+      <span class="label">策略动作</span>
+      <span class="value">${escapeHtml(strategyAction)}</span>
     </div>
     <div class="metric">
       <span class="label">降级兜底</span>

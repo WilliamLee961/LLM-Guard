@@ -88,7 +88,10 @@ def process_line_full_pipeline(line_data: dict, target_field: str,
     final_response = raw_model_response
     guard_stage = "PASS"
     guard_action = "pass"
+    guard_policy_action = "ALLOW"
     risk_info = "NONE"
+    response_strategy = {}
+    rewritten_query = ""
     error_msg = None
 
     try:
@@ -105,9 +108,17 @@ def process_line_full_pipeline(line_data: dict, target_field: str,
                 # 💥 输入违规 -> 拦截
                 final_response = content_in
                 guard_stage = "INPUT"
-                guard_action = meta_in.get("action", "blocked_input")
+                response_strategy = meta_in.get("response_strategy", {}) or {}
+                guard_policy_action = response_strategy.get("action", "SAFE_ANSWER")
+                guard_action = meta_in.get("action", f"blocked_input_{guard_policy_action.lower()}")
                 risk_info = str(meta_in.get("risk_profile", {}).get("overall_risk_level", "Unknown"))
                 input_blocked = True
+            else:
+                if meta_in.get("action") == "rewrote_input_query":
+                    rewritten_query = content_in
+                    response_strategy = meta_in.get("response_strategy", {}) or {}
+                    guard_policy_action = response_strategy.get("action", "REWRITE")
+                    guard_action = "rewrote_input_query_pass"
         
         # =================================================
         # Stage 2: Output Guard (使用 output_guard 实例)
@@ -121,7 +132,9 @@ def process_line_full_pipeline(line_data: dict, target_field: str,
                 # 💥 输出违规 -> 重写
                 final_response = content_out
                 guard_stage = "OUTPUT"
-                guard_action = meta_out.get("action", "rewrote_output")
+                response_strategy = meta_out.get("response_strategy", {}) or {}
+                guard_policy_action = response_strategy.get("action", "REWRITE")
+                guard_action = meta_out.get("action", f"rewrote_output_{guard_policy_action.lower()}")
                 risk_info = str(meta_out.get("risk_profile", {}).get("overall_risk_level", "Unknown"))
             elif guard_stage == "PASS":
                 # 只有全程通过才记录为 PASS 的 risk
@@ -152,7 +165,10 @@ def process_line_full_pipeline(line_data: dict, target_field: str,
             out_data[output_field_name] = final_response
             out_data["_guard_stage"] = guard_stage
             out_data["_guard_action"] = guard_action
+            out_data["_guard_policy_action"] = guard_policy_action
+            out_data["_guard_response_strategy"] = response_strategy
             out_data["_guard_risk"] = risk_info
+            out_data["_guard_rewritten_query"] = rewritten_query
             if error_msg:
                 out_data["_guard_error"] = error_msg
             inserted = True
@@ -160,7 +176,11 @@ def process_line_full_pipeline(line_data: dict, target_field: str,
     if not inserted:
         out_data[output_field_name] = final_response
         out_data["_guard_stage"] = guard_stage
+        out_data["_guard_action"] = guard_action
+        out_data["_guard_policy_action"] = guard_policy_action
+        out_data["_guard_response_strategy"] = response_strategy
         out_data["_guard_risk"] = risk_info
+        out_data["_guard_rewritten_query"] = rewritten_query
 
     return out_data
 

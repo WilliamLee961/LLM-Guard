@@ -73,6 +73,7 @@ EXAMPLE_PROMPTS: List[Dict[str, str]] = [
 def _convert_real_pipeline_result(result: Dict[str, Any], difficulty: DifficultyMode) -> Dict[str, Any]:
     input_violation = int(result.get("input_violation", 0) or 0)
     output_violation = int(result.get("output_violation", 0) or 0)
+    strategy = result.get("response_strategy") or {}
 
     blocked_stage = None
     if input_violation == 1:
@@ -82,25 +83,30 @@ def _convert_real_pipeline_result(result: Dict[str, Any], difficulty: Difficulty
 
     action = "pass"
     if blocked_stage == "input":
-        action = "blocked_input"
+        policy_action = str(strategy.get("action", "SAFE_ANSWER")).lower()
+        action = f"blocked_input_{policy_action}"
     elif blocked_stage == "output":
-        action = "rewrote_output"
+        policy_action = str(strategy.get("action", "REWRITE")).lower()
+        action = "rewrote_output" if policy_action == "rewrite" else f"replaced_output_{policy_action}"
 
     return {
         "engine_used": "real",
         "difficulty": difficulty,
         "blocked_stage": blocked_stage,
         "action": action,
+        "response_strategy": strategy,
         "input_guard": {
             "router_ctx": result.get("router_ctx_in", {}),
             "risk_profile": result.get("input_risk_profile", {}),
             "pred_violation": input_violation,
+            "response_strategy": strategy if blocked_stage == "input" else {"action": "ALLOW"},
         },
         "model": {"raw_answer": result.get("model_answer", "") or ""},
         "output_guard": {
             "router_ctx": result.get("router_ctx_out", {}),
             "risk_profile": result.get("output_risk_profile", {}),
             "pred_violation": output_violation,
+            "response_strategy": strategy if blocked_stage == "output" else {"action": "ALLOW"},
         },
         "final_answer": result.get("final_answer", "") or "",
     }

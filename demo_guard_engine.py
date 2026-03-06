@@ -5,6 +5,12 @@ import time
 import uuid
 from typing import Any, Dict, List, Literal
 
+from response_policy import (
+    render_fallback_safe_response,
+    rewrite_query_for_safe_mode,
+    select_response_action,
+)
+
 DifficultyMode = Literal["lenient", "normal", "strict", "any_risk", "overall_l2plus"]
 
 RISK_CATEGORIES: List[str] = [
@@ -315,15 +321,19 @@ def generate_model_answer(query: str, simulate_unsafe_output: bool) -> str:
     )
 
 
-def build_safe_reply(query: str, risk_profile: Dict[str, Any], stage: str) -> str:
-    risks = _top_risks(risk_profile, min_level="LOW")
-    risk_text = "、".join(risks[:4]) if risks else "GENERAL_RISK"
-    prefix = "输入请求" if stage == "input" else "模型输出"
-    return (
-        f"已触发{prefix}安全拦截。"
-        f"检测到风险类别：{risk_text}。"
-        "我不能提供可能造成伤害、违法或绕过安全策略的内容。"
-        "如果你愿意，我可以提供合规替代方案、风险解释和正规求助路径。"
+def build_safe_reply(
+    query: str,
+    risk_profile: Dict[str, Any],
+    stage: str,
+    strategy: Dict[str, Any],
+    original_answer: str = "",
+) -> str:
+    return render_fallback_safe_response(
+        query=query,
+        strategy=strategy,
+        risk_profile=risk_profile,
+        stage=stage,
+        original_answer=original_answer,
     )
 
 
@@ -336,26 +346,77 @@ def run_demo_guarded_chat(
     request_id = str(uuid.uuid4())
 
     input_step = analyze_text(query, difficulty)
-    input_violation = input_step["pred_violation"]
+    input_strategy = select_response_action(
+        stage="input",
+        difficulty=difficulty,
+        input_risk_profile=input_step["risk_profile"],
+        output_risk_profile={},
+        router_ctx_in=input_step["router_ctx"],
+        router_ctx_out={},
+    )
+    input_action = str(input_strategy.get("action", "ALLOW")).upper()
+    rewritten_query = query
+    if input_action == "REWRITE":
+        rewritten_query = rewrite_query_for_safe_mode(query, input_strategy)
+
+    input_violation = 1 if input_action in {"SAFE_ANSWER", "REFUSE", "ESCALATE"} else 0
+    input_step["pred_violation"] = input_violation
 
     raw_answer = ""
     output_step = {"router_ctx": {}, "risk_profile": {"risk_levels": {}, "overall_risk_level": "L1"}, "pred_violation": 0}
+    output_strategy: Dict[str, Any] = {"action": "ALLOW"}
     blocked_stage = None
+
+    input_rewritten = input_action == "REWRITE"
 
     if input_violation == 1:
         blocked_stage = "input"
-        final_answer = build_safe_reply(query, input_step["risk_profile"], stage="input")
-        action = "blocked_input"
+        final_answer = build_safe_reply(
+            query=query,
+            risk_profile=input_step["risk_profile"],
+            stage="input",
+            strategy=input_strategy,
+        )
+        action = f"blocked_input_{str(input_strategy.get('action', 'SAFE_ANSWER')).lower()}"
     else:
-        raw_answer = generate_model_answer(query, simulate_unsafe_output=simulate_unsafe_output)
+        raw_answer = generate_model_answer(rewritten_query, simulate_unsafe_output=simulate_unsafe_output)
         output_step = analyze_text(raw_answer, difficulty)
-        if output_step["pred_violation"] == 1:
+        output_strategy = select_response_action(
+            stage="output",
+            difficulty=difficulty,
+            input_risk_profile=input_step["risk_profile"],
+            output_risk_profile=output_step["risk_profile"],
+            router_ctx_in=input_step["router_ctx"],
+            router_ctx_out=output_step["router_ctx"],
+        )
+        output_violation = 0 if output_strategy.get("action") == "ALLOW" else 1
+        output_step["pred_violation"] = output_violation
+
+        if output_violation == 1:
             blocked_stage = "output"
-            final_answer = build_safe_reply(query, output_step["risk_profile"], stage="output")
-            action = "rewrote_output"
+            if output_strategy.get("action") == "REWRITE":
+                safe_draft = generate_model_answer(rewritten_query, simulate_unsafe_output=False)
+                final_answer = (
+                    "已执行输出侧合规改写（保留可用信息，移除风险细节）：\n"
+                    f"{safe_draft}\n\n"
+                    "如果你愿意，我可以继续把这份答案细化成逐步执行清单。"
+                )
+                action = "rewrote_output"
+            else:
+                final_answer = build_safe_reply(
+                    query=query,
+                    risk_profile=output_step["risk_profile"],
+                    stage="output",
+                    strategy=output_strategy,
+                    original_answer=raw_answer,
+                )
+                action = f"replaced_output_{str(output_strategy.get('action', 'SAFE_ANSWER')).lower()}"
         else:
             final_answer = raw_answer
             action = "pass"
+
+    if action == "pass" and input_rewritten:
+        action = "rewrote_input_query_pass"
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     return {
@@ -363,16 +424,20 @@ def run_demo_guarded_chat(
         "engine_used": "demo",
         "difficulty": difficulty,
         "blocked_stage": blocked_stage,
+        "response_strategy": input_strategy if blocked_stage == "input" else output_strategy,
         "input_guard": {
             "router_ctx": input_step["router_ctx"],
             "risk_profile": input_step["risk_profile"],
             "pred_violation": input_step["pred_violation"],
+            "response_strategy": input_strategy,
+            "rewritten_query": rewritten_query if rewritten_query != query else "",
         },
         "model": {"raw_answer": raw_answer},
         "output_guard": {
             "router_ctx": output_step.get("router_ctx", {}),
             "risk_profile": output_step.get("risk_profile", {}),
             "pred_violation": output_step.get("pred_violation", 0),
+            "response_strategy": output_strategy,
         },
         "final_answer": final_answer,
         "action": action,
