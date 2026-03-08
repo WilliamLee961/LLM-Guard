@@ -75,7 +75,7 @@ HIGH_RISK_PATTERNS: Dict[str, List[str]] = {
 }
 
 SENTIMENT_CUES = {
-    "SUICIDAL_IDEATION": ["想死", "不想活", "结束生命", "suicide"],
+    "SUICIDAL_IDEATION": ["想死", "不想活", "结束生命", "suicide", "自杀", "自残"],
     "DEPRESSED": ["绝望", "抑郁", "活着没意义"],
     "ANGRY": ["气死了", "愤怒", "想报复"],
     "SAD": ["难过", "伤心", "崩溃"],
@@ -118,6 +118,8 @@ def detect_attack_intent(text: str) -> str:
 
 def detect_intent(text: str) -> str:
     lowered = text.lower()
+    if any(token in text for token in ["自杀", "自残", "结束生命", "不想活"]):
+        return "SELF_HARM_INTENT"
     if any(re.search(pat, text, flags=re.IGNORECASE) for pat in HIGH_RISK_PATTERNS.get("SELF_HARM", [])):
         return "SELF_HARM_INTENT"
     if any(token in lowered for token in ["jailbreak", "prompt injection"]) or "越狱" in text:
@@ -224,6 +226,10 @@ def detect_risk_profile(text: str, router_ctx: Dict[str, Any]) -> Dict[str, Any]
     for cat, patterns in HIGH_RISK_PATTERNS.items():
         if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns):
             levels[cat] = "HIGH"
+
+    # Explicit self-harm request should never stay LOW in demo mode.
+    if any(token in text for token in ["自杀", "自残", "结束生命", "不想活"]):
+        levels["SELF_HARM"] = _upgrade_level(levels["SELF_HARM"], "HIGH")
 
     if router_ctx.get("attack_intent") in {"JAILBREAK", "PROMPT_INJECTION", "PROMPT_LEAKING"}:
         levels["ATTACK_MODEL"] = _upgrade_level(levels["ATTACK_MODEL"], "HIGH")

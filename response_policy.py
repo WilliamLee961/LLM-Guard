@@ -153,6 +153,13 @@ def select_response_action(
     if sentiment in _SELF_HARM_EMERGENCY or "SELF_HARM" in risk_names and overall in {"L3", "L4"}:
         action = "ESCALATE"
 
+    # Hard safety override: self-harm related requests must not be ALLOW/REWRITE.
+    if "SELF_HARM" in risk_names or intent == "SELF_HARM_INTENT":
+        if sentiment in _SELF_HARM_EMERGENCY or overall in {"L3", "L4"}:
+            action = "ESCALATE"
+        else:
+            action = "SAFE_ANSWER"
+
     # Output-side utility preservation:
     # if user intent is benign but generated answer is unsafe, prefer REWRITE over hard refusal.
     input_overall = _normalize_overall((input_risk_profile or {}).get("overall_risk_level") or "L1")
@@ -223,34 +230,38 @@ def render_fallback_safe_response(
     stage: str,
     original_answer: str = "",
 ) -> str:
-    action = strategy.get("action", "SAFE_ANSWER")
+    action = str(strategy.get("action", "SAFE_ANSWER")).upper()
     risks = strategy.get("top_risks") or top_risks(risk_profile, min_level="LOW")
     risk_names = [name for name, _ in risks] or ["OTHER_RISK"]
 
-    heading = _build_heading(action, stage)
     alternatives = _collect_alternatives(risk_names)
-    risk_hint = "、".join(risk_names[:4])
-
-    lines: List[str] = [heading]
-    lines.append(f"1) 风险判断：检测到与 {risk_hint} 相关的高风险内容，不能提供可直接执行的危险细节。")
-
-    if action == "REWRITE" and original_answer:
-        lines.append("2) 合规改写：已移除可能导致违法、伤害或绕过安全策略的步骤，仅保留合法与防护向信息。")
-        lines.append(f"   - {_task_preserving_help(query)}")
-    else:
-        lines.append("2) 替代方向：你可以改为以下安全目标（我可继续展开到步骤级）。")
-
-    for i, item in enumerate(alternatives, start=1):
-        lines.append(f"   - {item}")
 
     if action == "ESCALATE":
-        lines.append("3) 立即建议：如果你或他人处于紧急危险，请立刻联系当地急救电话或可信任的家人朋友。")
-    else:
-        lines.append("3) 下一步：告诉我你希望采用的替代目标，我会给你一版可直接执行的详细方案。")
+        return (
+            "听到你这样说，我很担心你现在的状态。你不需要一个人扛着。\n"
+            "先请你马上做三件事：远离身边危险物品、联系你信任的家人或朋友陪你、并尽快联系当地急救电话或心理危机干预热线。\n"
+            "如果你愿意，我可以继续陪你，把接下来几分钟的稳定情绪步骤一起做完。"
+        )
 
-    if query:
-        lines.append(f"\n你原始问题是：{query}")
+    if action == "REFUSE":
+        lines = ["这个请求我不能直接协助。你可以换成这些安全方向："]
+        for item in alternatives:
+            lines.append(f"- {item}")
+        lines.append("告诉我你想选哪一种，我可以马上给你可执行步骤。")
+        return "\n".join(lines)
 
+    if action == "REWRITE":
+        lines = ["下面是处理后的安全版本回答："]
+        lines.append(_task_preserving_help(query))
+        for item in alternatives[:2]:
+            lines.append(f"- {item}")
+        return "\n".join(lines)
+
+    # SAFE_ANSWER
+    lines = ["我不能提供可能造成伤害或违法的具体做法，但我可以这样帮助你："]
+    for item in alternatives:
+        lines.append(f"- {item}")
+    lines.append("如果你告诉我你的真实目标，我会给你合规且可执行的方案。")
     return "\n".join(lines)
 
 
