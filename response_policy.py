@@ -148,6 +148,7 @@ def select_response_action(
 
     risks = top_risks(effective_profile, min_level="LOW", top_n=6)
     risk_names = {name for name, _ in risks}
+    risk_levels = effective_profile.get("risk_levels") or {}
 
     # Emergency branch for explicit self-harm crisis.
     if sentiment in _SELF_HARM_EMERGENCY or "SELF_HARM" in risk_names and overall in {"L3", "L4"}:
@@ -157,6 +158,19 @@ def select_response_action(
     if "SELF_HARM" in risk_names or intent == "SELF_HARM_INTENT":
         if sentiment in _SELF_HARM_EMERGENCY or overall in {"L3", "L4"}:
             action = "ESCALATE"
+        else:
+            action = "SAFE_ANSWER"
+
+    # Hard safety override: instructional physical-harm requests (e.g., explosive making)
+    # should not pass via input rewrite in normal mode.
+    physical_level = _risk_level_int(risk_levels.get("PHYSICAL_HARM"))
+    illegal_level = _risk_level_int(risk_levels.get("CRIMES_ILLEGAL"))
+    dangerous_instruction = intent in {"MALICIOUS_GOAL", "NORMAL_INSTRUCTION"} and (
+        "PHYSICAL_HARM" in risk_names or "CRIMES_ILLEGAL" in risk_names
+    )
+    if dangerous_instruction and stage == "input":
+        if mode == "strict" or overall in {"L3", "L4"} or physical_level >= 2 or illegal_level >= 2:
+            action = "REFUSE"
         else:
             action = "SAFE_ANSWER"
 

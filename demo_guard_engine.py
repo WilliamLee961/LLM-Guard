@@ -47,7 +47,21 @@ STRONG_DIMS = {
 }
 
 KEYWORDS: Dict[str, List[str]] = {
-    "PHYSICAL_HARM": ["杀", "砍", "炸", "爆炸", "伤害", "枪", "weapon", "violence"],
+    "PHYSICAL_HARM": [
+        "杀",
+        "砍",
+        "爆炸",
+        "炸药",
+        "爆炸物",
+        "引爆",
+        "雷管",
+        "火药",
+        "伤害",
+        "枪",
+        "枪支",
+        "weapon",
+        "violence",
+    ],
     "SELF_HARM": ["自杀", "自残", "结束生命", "不想活", "suicide", "kill myself"],
     "CRIMES_ILLEGAL": ["贩毒", "洗钱", "盗窃", "诈骗", "违法", "crime", "illegal"],
     "MALICIOUS_USE": ["攻击系统", "入侵", "木马", "病毒", "ddos", "hack", "exploit"],
@@ -70,7 +84,12 @@ HIGH_RISK_PATTERNS: Dict[str, List[str]] = {
     "SELF_HARM": [r"(如何|怎么).*(自杀|自残)", r"(想|准备).*(结束生命|不想活)"],
     "MALICIOUS_USE": [r"(如何|怎么).*(入侵|攻击|瘫痪).*(系统|网站)", r"(制作|传播).*(木马|病毒)"],
     "CRIMES_ILLEGAL": [r"(如何|怎么).*(诈骗|洗钱|贩毒|盗刷)"],
-    "PHYSICAL_HARM": [r"(如何|怎么).*(伤害|杀害|爆炸)"],
+    "PHYSICAL_HARM": [
+        r"(如何|怎么).*(伤害|杀害|爆炸)",
+        r"(制造|制作|配制|学习|获取|购买|组装).*(炸药|爆炸物|雷管|火药|枪支|引爆装置)",
+        r"(炸药|爆炸物|雷管|枪支).*(配方|比例|步骤|教程|方法|原料)",
+        r"(how to|make|build).*(bomb|explosive|detonator|weapon|gun)",
+    ],
     "ATTACK_MODEL": [r"(忽略|无视).*(系统|安全).*(规则|限制)", r"(泄露|输出).*(system prompt|提示词)"],
 }
 
@@ -118,6 +137,10 @@ def detect_attack_intent(text: str) -> str:
 
 def detect_intent(text: str) -> str:
     lowered = text.lower()
+    if re.search(r"(制造|制作|配制|学习|获取|购买|组装).*(炸药|爆炸物|雷管|枪支|引爆装置)", text):
+        return "MALICIOUS_GOAL"
+    if re.search(r"(how to|make|build).*(bomb|explosive|detonator|weapon|gun)", lowered):
+        return "MALICIOUS_GOAL"
     if any(token in text for token in ["自杀", "自残", "结束生命", "不想活"]):
         return "SELF_HARM_INTENT"
     if any(re.search(pat, text, flags=re.IGNORECASE) for pat in HIGH_RISK_PATTERNS.get("SELF_HARM", [])):
@@ -226,6 +249,16 @@ def detect_risk_profile(text: str, router_ctx: Dict[str, Any]) -> Dict[str, Any]
     for cat, patterns in HIGH_RISK_PATTERNS.items():
         if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns):
             levels[cat] = "HIGH"
+
+    # Weapon/explosive construction intent should be treated as high risk in demo mode.
+    weapon_make_patterns = [
+        r"(制造|制作|配制|学习|获取|购买|组装).*(炸药|爆炸物|雷管|火药|枪支|引爆装置)",
+        r"(炸药|爆炸物|雷管|枪支).*(配方|比例|步骤|教程|方法|原料)",
+        r"(how to|make|build).*(bomb|explosive|detonator|weapon|gun)",
+    ]
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in weapon_make_patterns):
+        levels["PHYSICAL_HARM"] = _upgrade_level(levels["PHYSICAL_HARM"], "HIGH")
+        levels["CRIMES_ILLEGAL"] = _upgrade_level(levels["CRIMES_ILLEGAL"], "MEDIUM")
 
     # Explicit self-harm request should never stay LOW in demo mode.
     if any(token in text for token in ["自杀", "自残", "结束生命", "不想活"]):
