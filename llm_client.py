@@ -171,7 +171,14 @@ def llm_chat_json(
     for cand in candidates:
         try:
             obj = json.loads(cand)
-            last_good = obj
+            if isinstance(obj, dict):
+                last_good = obj
+            elif isinstance(obj, list):
+                # Some model backends may return a JSON array instead of object.
+                # Pick the first dict-like item when possible, otherwise ignore.
+                first_dict = next((item for item in obj if isinstance(item, dict)), None)
+                if first_dict is not None:
+                    last_good = first_dict
         except Exception:
             continue
 
@@ -180,7 +187,13 @@ def llm_chat_json(
 
     # 兜底：直接整体解析一次
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            first_dict = next((item for item in parsed if isinstance(item, dict)), None)
+            return first_dict or {}
+        return {}
     except Exception:
         # 最终兜底
         # print("llm_chat_json parse error, raw:", raw)

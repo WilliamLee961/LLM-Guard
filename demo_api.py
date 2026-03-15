@@ -47,6 +47,11 @@ def _format_real_error(exc: Exception) -> str:
         or "timed out" in msg.lower()
     ):
         return f"{msg} ({base_hint}{proxy_hint})"
+    if "'list' object has no attribute 'get'" in msg:
+        return (
+            f"{msg} ({base_hint}). real 链路返回了非预期 JSON 结构（数组而非对象），"
+            "系统已自动降级到 demo 引擎。请检查模型 JSON 输出格式。"
+        )
     if "InvalidEndpointOrModel.NotFound" in msg or "does not exist or you do not have access to it" in msg:
         return (
             f"{msg} ({base_hint}). Ark 调用需使用可访问的推理接入点 ID："
