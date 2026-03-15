@@ -4,6 +4,7 @@ import os
 import re
 from typing import Dict, Any, List, Optional
 
+import httpx
 from openai import OpenAI
 
 
@@ -11,18 +12,44 @@ from openai import OpenAI
 # OpenAI 兼容客户端配置
 # =========================
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "EMPTY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://100.87.153.109:8000/v1")
-OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "60"))
+def _pick_env(*keys: str, default: str) -> str:
+    for key in keys:
+        value = os.getenv(key)
+        if value is not None:
+            value = value.strip()
+            if value:
+                return value
+    return default
+
+
+# 兼容 OpenAI 与火山方舟(Ark)环境变量
+OPENAI_API_KEY = _pick_env("ARK_API_KEY", "OPENAI_API_KEY", default="EMPTY")
+OPENAI_BASE_URL = _pick_env(
+    "ARK_BASE_URL",
+    "OPENAI_BASE_URL",
+    default="http://100.87.153.109:8000/v1",
+)
+OPENAI_TIMEOUT = float(_pick_env("ARK_TIMEOUT", "OPENAI_TIMEOUT", default="60"))
+OPENAI_TRUST_ENV_PROXY = _pick_env("ARK_TRUST_ENV_PROXY", "OPENAI_TRUST_ENV_PROXY", default="0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+http_client = httpx.Client(
+    timeout=OPENAI_TIMEOUT,
+    trust_env=OPENAI_TRUST_ENV_PROXY,
+)
 
 client = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
     timeout=OPENAI_TIMEOUT,
+    http_client=http_client,
 )
 
 # 你实际用的模型名字：
-MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "Qwen")
+MODEL_NAME = _pick_env("ARK_ENDPOINT_ID", "ARK_MODEL_NAME", "OPENAI_MODEL_NAME", default="Qwen")
 
 # =========================
 # 基础聊天封装

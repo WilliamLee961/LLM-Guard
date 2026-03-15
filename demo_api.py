@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from demo_guard_engine import analyze_text as demo_analyze_text
 from demo_guard_engine import run_demo_guarded_chat
+from llm_client import MODEL_NAME, OPENAI_BASE_URL
 
 REAL_PIPELINE_AVAILABLE = False
 REAL_PIPELINE_ERROR: Optional[str] = None
@@ -26,6 +27,38 @@ try:
     REAL_PIPELINE_AVAILABLE = True
 except Exception as exc:  # pragma: no cover - availability depends on environment
     REAL_PIPELINE_ERROR = str(exc)
+
+
+def _format_real_error(exc: Exception) -> str:
+    msg = str(exc) or exc.__class__.__name__
+    base_hint = f"base_url={OPENAI_BASE_URL}, model={MODEL_NAME}"
+    proxy_hint = ""
+    # Imported lazily to avoid touching env unless needed.
+    import os
+
+    proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    if proxy:
+        proxy_hint = f", http_proxy={proxy}"
+
+    if (
+        "Connection error" in msg
+        or "Max retries exceeded" in msg
+        or "Failed to establish a new connection" in msg
+        or "timed out" in msg.lower()
+    ):
+        return f"{msg} ({base_hint}{proxy_hint})"
+    if "InvalidEndpointOrModel.NotFound" in msg or "does not exist or you do not have access to it" in msg:
+        return (
+            f"{msg} ({base_hint}). Ark 调用需使用可访问的推理接入点 ID："
+            "请在方舟控制台复制 Endpoint ID（常见为 ep- 开头），"
+            "并确认 API Key 与接入点处于同一地域/项目。"
+        )
+    if "InvalidEndpointOrModel.ModelIDAccessDisabled" in msg:
+        return (
+            f"{msg} ({base_hint}). 当前账号未开通“直接按模型 ID 调用”权限："
+            "请改用自建推理接入点 ID（ARK_ENDPOINT_ID）调用。"
+        )
+    return msg
 
 
 DifficultyMode = Literal["lenient", "normal", "strict", "any_risk", "overall_l2plus"]
@@ -114,11 +147,16 @@ def _convert_real_pipeline_result(result: Dict[str, Any], difficulty: Difficulty
 
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
+    import os
+
     return {
         "ok": True,
         "service": "llm-guard-demo",
         "real_pipeline_available": REAL_PIPELINE_AVAILABLE,
         "real_pipeline_error": REAL_PIPELINE_ERROR,
+        "llm_base_url": OPENAI_BASE_URL,
+        "llm_model_name": MODEL_NAME,
+        "http_proxy": os.getenv("HTTP_PROXY") or os.getenv("http_proxy"),
     }
 
 
@@ -152,7 +190,7 @@ def guarded_chat(req: GuardedChatRequest) -> Dict[str, Any]:
                 result = _convert_real_pipeline_result(real_result, req.difficulty)
             except Exception as exc:
                 used_fallback = True
-                fallback_reason = str(exc)
+                fallback_reason = _format_real_error(exc)
                 result = run_demo_guarded_chat(
                     query=query,
                     difficulty=req.difficulty,

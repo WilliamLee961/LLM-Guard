@@ -15,13 +15,54 @@ pip install -r requirements-demo.txt
 ```
 
 如果你要启用 `real` 模式，还需要安装仓库原有依赖（如 `langgraph/openai/faiss` 等）。
-另外可通过环境变量配置真实模型地址（`llm_client.py` 已支持）：
+另外可通过环境变量配置真实模型地址（`llm_client.py` 已支持 OpenAI 与 Ark 兼容格式）：
 
 ```bash
 set OPENAI_BASE_URL=http://your-host:8000/v1
 set OPENAI_MODEL_NAME=Qwen
 set OPENAI_API_KEY=EMPTY
 ```
+
+### 使用火山方舟（Ark）API（推荐用于演示）
+
+在 PowerShell 中设置（注意 `ARK_ENDPOINT_ID` 必须填你的“推理接入点 Endpoint ID”）：
+
+```powershell
+$env:ARK_API_KEY="你的API Key"
+$env:ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
+$env:ARK_ENDPOINT_ID="ep-xxxxxxxxxxxxxxxx"
+$env:OPENAI_TRUST_ENV_PROXY="0"
+```
+
+如果曾经设置过 `$env:OPENAI_MODEL_NAME="Qwen"`，请清掉，避免模型名被旧值覆盖：
+
+```powershell
+Remove-Item Env:OPENAI_MODEL_NAME -ErrorAction SilentlyContinue
+```
+
+然后启动：
+
+```powershell
+python -m uvicorn demo_api:app --host 0.0.0.0 --port 8787 --reload
+```
+
+快速检查是否已连接到 Ark：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8787/api/health
+```
+
+`/api/health` 返回里应看到你设置的 `llm_base_url` 和 `llm_model_name`。
+
+#### 常见报错排查（Ark）
+
+- 报错 `InvalidEndpointOrModel.NotFound`：
+  - 当前 `model` 不存在，或你无权限访问。
+  - 优先在控制台复制“推理接入点 Endpoint ID”（常见为 `ep-...`），设置到 `ARK_ENDPOINT_ID`。
+  - 确认 `ARK_BASE_URL` 地域与接入点地域一致（例如北京区使用 `ark.cn-beijing.volces.com`）。
+  - 确认 API Key 与该接入点在同一项目/账号下。
+- 报错 `InvalidEndpointOrModel.ModelIDAccessDisabled`：
+  - 说明账号未开通“按模型 ID 直连”能力，请改用你创建的 `Endpoint ID`。
 
 ## 2. 启动服务
 
