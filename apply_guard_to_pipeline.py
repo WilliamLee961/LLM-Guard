@@ -7,7 +7,11 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from datetime import datetime
-import faiss
+
+try:
+    import faiss  # type: ignore
+except Exception:
+    faiss = None
 
 """
 调用方法：python apply_guard_to_pipeline.py   --input_detect_mode strict   --output_detect_mode normal   --enable_input_guard   --enable_output_guard
@@ -201,7 +205,8 @@ def main():
         print("-" * 40)
         print("[System] 正在检查 RAG 核心依赖 (faiss)...")
         try:
-            import faiss
+            if faiss is None:
+                raise ImportError("faiss is not installed")
             # 打印路径以确认加载了正确的库
             print(f"[System] ✅ faiss 模块加载成功。")
             if hasattr(faiss, '__file__'):

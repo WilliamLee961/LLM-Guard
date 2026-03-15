@@ -13,7 +13,6 @@ from response_policy import (
     rewrite_query_for_safe_mode,
     select_response_action,
 )
-import faiss
 
 class QAState(TypedDict, total=False):
     """
