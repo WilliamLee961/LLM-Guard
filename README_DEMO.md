@@ -8,6 +8,10 @@
   - `demo`: 本地规则引擎，稳定、无外部依赖，适合现场演示
   - `real`: 调用仓库已有 `run_safe_qa/run_guardrails` 真实链路
 
+如果你要跑论文实验（baseline 对比、阈值校准、Mac 启动流程），请看：
+
+- `README_RESEARCH.md`
+
 ## 1. 安装依赖
 
 ```bash

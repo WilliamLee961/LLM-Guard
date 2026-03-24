@@ -87,6 +87,34 @@ def _guess_focus_risk_from_profiles(
     return []
 
 
+def _derive_safe_objective(
+    query: str,
+    router_ctx_in: Dict[str, Any],
+    strategy: Dict[str, Any],
+) -> str:
+    """
+    从用户原始意图中提取“可保留目标”，用于提升安全改写的任务可用性。
+    """
+    intent = str(router_ctx_in.get("intent", "OTHER")).upper()
+    risks = [name for name, _ in (strategy.get("top_risks") or [])]
+    q = (query or "").strip()
+    q_lower = q.lower()
+
+    if intent == "ATTACK_MODEL":
+        return "将请求转换为防御目标：识别提示注入风险、给出系统加固与审计方案。"
+    if "SELF_HARM" in risks or intent == "SELF_HARM_INTENT":
+        return "将目标转换为情绪稳定和求助支持：先降风险，再给现实可执行求助步骤。"
+    if {"PHYSICAL_HARM", "CRIMES_ILLEGAL", "MALICIOUS_USE"} & set(risks):
+        return "保留合法学习目标，转换为法律合规、风险预防和安全替代方案。"
+    if "sql" in q_lower or "数据库" in q:
+        return "保留数据库优化目标，输出合规性能优化步骤，不涉及攻击或破坏。"
+    if "ppt" in q_lower or "汇报" in q or "方案" in q:
+        return "保留汇报目标，输出结构化提纲与落地计划。"
+    if "代码" in q or "python" in q_lower or "java" in q_lower:
+        return "保留开发目标，提供最小权限、输入校验与安全库实践。"
+    return "保留用户的合法业务目标，移除危险实现细节，并给可执行替代路径。"
+
+
 # =========================
 # 各个节点（Node）
 # =========================
@@ -280,8 +308,10 @@ def safe_answer_node(state: QAState) -> QAState:
     )
 
     user_prompt_parts: List[str] = []
+    safe_objective = _derive_safe_objective(q, router_ctx_in, strategy)
 
     user_prompt_parts.append(f"【用户原始问题】\n{q}\n")
+    user_prompt_parts.append(f"【应保留的合法目标】\n{safe_objective}\n")
     user_prompt_parts.append(f"【当前处理阶段】\n{guard_stage}\n")
     user_prompt_parts.append(f"【决策策略】\n{strategy}\n")
 
@@ -308,20 +338,23 @@ def safe_answer_node(state: QAState) -> QAState:
     if strategy.get("action") == "REWRITE":
         user_prompt_parts.append(
             "请执行“安全改写”，输出一份可直接给用户的最终回答：\n"
-            "1) 保留原回答中合法且有用的信息；\n"
-            "2) 删除或替换危险细节（违法、伤害、越狱、欺诈等）；\n"
-            "3) 给出2-4条可执行的合规替代步骤；\n"
-            "4) 语言自然，不要只说套话，不要空泛道歉。\n"
+            "1) 先保留“应保留的合法目标”；\n"
+            "2) 保留原回答中合法且有用的信息；\n"
+            "3) 删除或替换危险细节（违法、伤害、越狱、欺诈等）；\n"
+            "4) 给出2-4条可执行的合规替代步骤；\n"
+            "5) 给出一个下一步可执行动作（如检查清单/求助路径/防护措施）；\n"
+            "6) 语言自然，不要只说套话，不要空泛道歉。\n"
             "请直接输出最终文本，不要解释你的改写过程。"
         )
     else:
         user_prompt_parts.append(
             "请执行“安全代答/拒答”，输出一份高帮助性的最终回答：\n"
             "1) 先用1句话说明风险边界；\n"
-            "2) 给出2-4条可执行替代方案（必须可落地）；\n"
-            "3) 给出下一步建议（必要时提示求助渠道）；\n"
-            "4) 不得输出可直接执行的危险细节；\n"
-            "5) 不要只有‘我不能回答’，必须提供建设性替代。\n"
+            "2) 再明确“可保留目标”；\n"
+            "3) 给出2-4条可执行替代方案（必须可落地）；\n"
+            "4) 给出下一步建议（必要时提示求助渠道）；\n"
+            "5) 不得输出可直接执行的危险细节；\n"
+            "6) 不要只有‘我不能回答’，必须提供建设性替代。\n"
             "请直接输出最终文本。"
         )
 

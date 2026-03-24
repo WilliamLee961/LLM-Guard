@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Dict, List, Literal, Tuple
 
 ActionType = Literal["ALLOW", "REWRITE", "SAFE_ANSWER", "REFUSE", "ESCALATE"]
 
 _OVERALL_ORDER = {"L1": 1, "L2": 2, "L3": 3, "L4": 4}
 _RISK_LEVEL_ORDER = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+_ACTION_SEVERITY = {"ALLOW": 0, "REWRITE": 1, "SAFE_ANSWER": 2, "REFUSE": 3, "ESCALATE": 4}
+_SEVERITY_ACTION = {v: k for k, v in _ACTION_SEVERITY.items()}
+_POLICY_CALIBRATION_CACHE: Dict[str, Any] | None = None
 
 # Chapter-3 response decision table:
 # lenient: L1->ALLOW, L2->ALLOW, L3->REWRITE, L4->REFUSE
@@ -80,6 +85,42 @@ _RISK_GUIDE: Dict[str, List[str]] = {
 }
 
 
+def _load_policy_calibration() -> Dict[str, Any]:
+    """
+    可选的策略校准配置（JSON）：
+    - 通过环境变量 GUARD_POLICY_CALIB_PATH 指定路径
+    - 未配置或加载失败时返回 {}
+    """
+    global _POLICY_CALIBRATION_CACHE
+    if _POLICY_CALIBRATION_CACHE is not None:
+        return _POLICY_CALIBRATION_CACHE
+
+    path = os.getenv("GUARD_POLICY_CALIB_PATH", "").strip()
+    if not path:
+        _POLICY_CALIBRATION_CACHE = {}
+        return _POLICY_CALIBRATION_CACHE
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            obj = {}
+    except Exception:
+        obj = {}
+
+    _POLICY_CALIBRATION_CACHE = obj
+    return _POLICY_CALIBRATION_CACHE
+
+
+def reset_policy_calibration_cache() -> None:
+    global _POLICY_CALIBRATION_CACHE
+    _POLICY_CALIBRATION_CACHE = None
+
+
+def _raise_action(action: ActionType, target: ActionType) -> ActionType:
+    return _SEVERITY_ACTION[max(_ACTION_SEVERITY[action], _ACTION_SEVERITY[target])]  # type: ignore[return-value]
+
+
 def _normalize_mode(mode: str) -> str:
     mode = (mode or "normal").lower()
     if mode in ("lenient", "normal", "strict"):
@@ -136,11 +177,22 @@ def select_response_action(
     """
     router_ctx_in = router_ctx_in or {}
     router_ctx_out = router_ctx_out or {}
+    calibration = _load_policy_calibration()
+    calibration_notes: List[str] = []
 
     mode = _normalize_mode(difficulty)
     effective_profile = _pick_risk_profile(stage, input_risk_profile or {}, output_risk_profile or {})
     overall = _normalize_overall(effective_profile.get("overall_risk_level") or "L1")
     action: ActionType = _ACTION_TABLE[mode][overall]
+
+    mode_overrides = calibration.get("mode_overrides") or {}
+    if isinstance(mode_overrides, dict):
+        mode_map = mode_overrides.get(mode) or {}
+        if isinstance(mode_map, dict):
+            override_action = str(mode_map.get(overall, "")).upper()
+            if override_action in _ACTION_SEVERITY:
+                action = override_action  # type: ignore[assignment]
+                calibration_notes.append(f"mode_override:{mode}:{overall}->{override_action}")
 
     sentiment = (router_ctx_in.get("sentiment") or router_ctx_out.get("sentiment") or "").upper()
     intent = (router_ctx_in.get("intent") or "OTHER").upper()
@@ -174,6 +226,22 @@ def select_response_action(
         else:
             action = "SAFE_ANSWER"
 
+    hard_refuse = calibration.get("input_hard_refuse_min") or {}
+    if stage == "input" and isinstance(hard_refuse, dict):
+        for cat, threshold in hard_refuse.items():
+            cat_name = str(cat).upper()
+            min_lv = _risk_level_int(str(threshold).upper())
+            if min_lv <= 0:
+                continue
+            cur_lv = _risk_level_int(risk_levels.get(cat_name))
+            if cur_lv >= min_lv:
+                old_action = action
+                action = _raise_action(action, "REFUSE")
+                if action != old_action:
+                    calibration_notes.append(
+                        f"hard_refuse:{cat_name}:{risk_levels.get(cat_name, 'NONE')}>= {str(threshold).upper()}"
+                    )
+
     # Output-side utility preservation:
     # if user intent is benign but generated answer is unsafe, prefer REWRITE over hard refusal.
     input_overall = _normalize_overall((input_risk_profile or {}).get("overall_risk_level") or "L1")
@@ -187,6 +255,30 @@ def select_response_action(
     if attack_intent in {"JAILBREAK", "PROMPT_INJECTION"} and action == "ALLOW":
         action = "REWRITE" if stage == "output" else "SAFE_ANSWER"
 
+    # Uncertainty-aware calibration (来自 risk_hub 的多视角分歧分数).
+    debug = effective_profile.get("debug") if isinstance(effective_profile, dict) else {}
+    multi_view = debug.get("multi_view") if isinstance(debug, dict) else {}
+    disagreement = 0
+    if isinstance(multi_view, dict):
+        try:
+            disagreement = int(multi_view.get("disagreement_count", 0) or 0)
+        except Exception:
+            disagreement = 0
+
+    in_safe_th = int(calibration.get("input_uncertainty_safe_answer_threshold", 3))
+    in_refuse_th = int(calibration.get("input_uncertainty_refuse_threshold", 6))
+    out_rewrite_th = int(calibration.get("output_uncertainty_rewrite_threshold", 4))
+
+    if stage == "input" and disagreement >= in_safe_th and action in {"ALLOW", "REWRITE"}:
+        action = _raise_action(action, "SAFE_ANSWER")
+        calibration_notes.append(f"uncertainty_safe_answer:disagreement={disagreement}")
+    if stage == "input" and disagreement >= in_refuse_th:
+        action = _raise_action(action, "REFUSE")
+        calibration_notes.append(f"uncertainty_refuse:disagreement={disagreement}")
+    if stage == "output" and disagreement >= out_rewrite_th and action == "ALLOW":
+        action = "REWRITE"
+        calibration_notes.append(f"uncertainty_output_rewrite:disagreement={disagreement}")
+
     return {
         "action": action,
         "difficulty": mode,
@@ -195,6 +287,8 @@ def select_response_action(
         "top_risks": risks,
         "intent": intent,
         "attack_intent": attack_intent,
+        "calibration_notes": calibration_notes,
+        "uncertainty_disagreement": disagreement,
     }
 
 

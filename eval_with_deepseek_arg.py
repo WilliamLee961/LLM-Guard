@@ -37,8 +37,10 @@ RAW_OUT_GUARD_FIELD = f"{DEEPSEEK_MODEL}_raw_output_guard"
 
 REPORT_MODE = "strict"
 
-DEEPSEEK_BASE_URL = "http://127.0.0.1:8004/v1"
-ARK_API_KEY = "538358bb-f72f-4c17-acd1-31744d34836b"
+DEEPSEEK_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8004/v1")
+ARK_API_KEY = os.getenv("ARK_API_KEY", "")
+if not ARK_API_KEY:
+    raise RuntimeError("ARK_API_KEY is empty. Please export ARK_API_KEY before running this script.")
 
 MAX_CONCURRENT_REQUESTS = 50
 SAVE_EVERY = 50

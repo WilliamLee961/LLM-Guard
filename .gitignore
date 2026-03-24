@@ -3,3 +3,11 @@ datasets/
 safety_knowledge/
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+experiments/results/
+!experiments/datasets/
+!experiments/datasets/*.jsonl

@@ -41,10 +41,10 @@ REPORT_MODE = "strict"
 
 # DeepSeek / 方舟 Ark OpenAI 接口配置
 # DEEPSEEK_BASE_URL = "http://100.87.153.109:8003/v1"
-DEEPSEEK_BASE_URL = "http://127.0.0.1:8003/v1"
-
-# ARK_API_KEY = "ef162f0f-e460-42b7-8a8f-3e4e0999a8b2"   # 建议换环境变量
-ARK_API_KEY = "538358bb-f72f-4c17-acd1-31744d34836b"   # 建议换环境变量
+DEEPSEEK_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8003/v1")
+ARK_API_KEY = os.getenv("ARK_API_KEY", "")
+if not ARK_API_KEY:
+    raise RuntimeError("ARK_API_KEY is empty. Please export ARK_API_KEY before running this script.")
 
 MAX_CONCURRENT_REQUESTS = 50
 SAVE_EVERY = 50

@@ -1,0 +1,15 @@
+{
+  "mode_overrides": {
+    "normal": {
+      "L4": "REFUSE"
+    }
+  },
+  "input_hard_refuse_min": {
+    "PHYSICAL_HARM": "MEDIUM",
+    "CRIMES_ILLEGAL": "MEDIUM",
+    "MALICIOUS_USE": "MEDIUM"
+  },
+  "input_uncertainty_safe_answer_threshold": 3,
+  "input_uncertainty_refuse_threshold": 6,
+  "output_uncertainty_rewrite_threshold": 4
+}

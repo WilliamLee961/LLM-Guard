@@ -1,4 +1,5 @@
 # risk_hub.py
+import os
 from typing import Dict, Any
 from llm_client import llm_chat_json
 from rag_helper import retrieve_relevant_docs, format_docs_for_prompt
@@ -359,6 +360,64 @@ def merge_risk_levels(base: Dict[str, str], refined: Dict[str, str]) -> Dict[str
     return out
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes"}
+
+
+def _normalize_profile(profile: Dict[str, Any], router_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    levels = profile.get("risk_levels") or {}
+    if not isinstance(levels, dict):
+        levels = {}
+
+    for key in RISK_CATEGORIES:
+        levels[key] = _norm_level(levels.get(key, "NONE"))
+
+    raw_overall = (profile.get("overall_risk_level") or "L1").upper()
+    overall = compute_overall_risk_level(levels, router_ctx)
+    return {
+        "risk_levels": levels,
+        "overall_risk_level_raw": raw_overall,
+        "overall_risk_level": overall,
+    }
+
+
+def _disagreement_count(levels_a: Dict[str, str], levels_b: Dict[str, str]) -> int:
+    cnt = 0
+    for key in RISK_CATEGORIES:
+        if _norm_level(levels_a.get(key, "NONE")) != _norm_level(levels_b.get(key, "NONE")):
+            cnt += 1
+    return cnt
+
+
+def _should_run_multi_view(
+    router_ctx: Dict[str, Any],
+    mode: str,
+    levels_stage1: Dict[str, str],
+) -> bool:
+    """
+    多视角检测触发策略：
+    - GUARD_MULTI_VIEW_ALWAYS=1 时总是触发
+    - 默认只在 input + 可疑路由信号 + 存在非 NONE 风险时触发，降低成本
+    """
+    if not _env_flag("GUARD_MULTI_VIEW_ENABLED", "1"):
+        return False
+    if _env_flag("GUARD_MULTI_VIEW_ALWAYS", "0"):
+        return True
+    if mode != "input":
+        return False
+
+    intent = (router_ctx.get("intent") or "OTHER").upper()
+    attack_intent = (router_ctx.get("attack_intent") or "NONE").upper()
+    slots = {str(x).upper() for x in (router_ctx.get("sensitive_slots") or [])}
+    has_non_none = any(_level_int(v) > 0 for v in levels_stage1.values())
+
+    suspicious_intent = intent in {"MALICIOUS_GOAL", "NORMAL_INSTRUCTION", "ATTACK_MODEL", "SELF_HARM_INTENT"}
+    suspicious_attack = attack_intent in {"JAILBREAK", "PROMPT_INJECTION", "PROMPT_LEAKING", "OTHER_ATTACK"}
+    suspicious_slots = bool({"WEAPON", "DRUG", "SELF_HARM", "PII", "FINANCIAL"} & slots)
+
+    return suspicious_intent or suspicious_attack or (suspicious_slots and has_non_none)
+
+
 # =========================
 # 主入口：风险检测（离散 + 可选 RAG 复核）
 # =========================
@@ -413,45 +472,59 @@ def detect_risk_discrete(
         max_tokens=1024,
     )
 
-    # --- 兜底处理：保证结构完整 ---
-    levels_1 = risk_profile_1.get("risk_levels") or {}
-    if not isinstance(levels_1, dict):
-        levels_1 = {}
+    profile_1 = _normalize_profile(risk_profile_1, router_ctx)
+    levels_1 = profile_1["risk_levels"]
 
-    for key in RISK_CATEGORIES:
-        levels_1[key] = _norm_level(levels_1.get(key, "NONE"))
+    # ===== 1.5 阶段：多视角复核（不确定性估计）=====
+    used_multi_view = False
+    multi_view_profile = None
+    disagreement_count = 0
+    base_profile = dict(profile_1)
 
-    risk_profile_1["risk_levels"] = levels_1
+    if _should_run_multi_view(router_ctx, mode, levels_1):
+        user_prompt_mv = (
+            f"检测阶段: {mode}（多视角复核）\n"
+            "请采用更保守的安全防御视角，重点识别隐含攻击意图、规避词、变体表达与潜在可执行危害。\n"
+            "如果文本看似中立但可被直接用于实施伤害/违法，请提升相关风险等级。\n\n"
+            f"路由上下文：\n{router_ctx_simplified}\n\n"
+            f"待检测文本：\n{text}\n\n"
+            "请只输出 JSON。"
+        )
+        risk_profile_mv_raw = llm_chat_json(
+            system_prompt=RISK_SYSTEM_PROMPT_DISCRETE,
+            user_prompt=user_prompt_mv,
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        profile_mv = _normalize_profile(risk_profile_mv_raw, router_ctx)
+        levels_mv = profile_mv["risk_levels"]
+        disagreement_count = _disagreement_count(levels_1, levels_mv)
+        merged_mv_levels = merge_risk_levels(levels_1, levels_mv)
+        base_profile = {
+            "risk_levels": merged_mv_levels,
+            "overall_risk_level": compute_overall_risk_level(merged_mv_levels, router_ctx),
+            "overall_risk_level_raw": profile_mv["overall_risk_level_raw"],
+        }
+        used_multi_view = True
+        multi_view_profile = profile_mv
 
-    # 模型给的整体等级（原始）
-    raw_overall_1 = (risk_profile_1.get("overall_risk_level") or "L1").upper()
-
-    # 使用本地规则统一计算整体风险等级
-    overall_1 = compute_overall_risk_level(levels_1, router_ctx)
-    risk_profile_1["overall_risk_level_raw"] = raw_overall_1
-    risk_profile_1["overall_risk_level"] = overall_1
-
-    # 默认结果先设为第一阶段
-    final_profile = dict(risk_profile_1)
+    # 默认结果先设为多视角合并结果（若未触发多视角则等于 stage1）
+    final_profile = dict(base_profile)
     used_rag = False
     stage2_profile = None
 
     # ===== 可选：第二阶段 RAG 复核 =====
-    if use_rag_on_uncertain and is_uncertain_case(levels_1, router_ctx):
-        # 1) RAG 检索相关政策/案例
+    levels_before_rag = final_profile.get("risk_levels") or {}
+    if use_rag_on_uncertain and is_uncertain_case(levels_before_rag, router_ctx):
         docs = retrieve_relevant_docs(text, top_k=5)
         if docs:
             docs_text = format_docs_for_prompt(docs)
-
-            # 2) 带 RAG 的第二阶段检测
             user_prompt_2 = (
                 f"检测阶段: {mode}（带RAG复核）\n"
-                f"以下是对用户输入的结构化分析结果(路由上下文)：\n"
-                f"{router_ctx_simplified}\n\n"
-                f"下面是与该内容相关的安全政策、使用条款或历史案例片段：\n"
-                f"{docs_text}\n\n"
-                f"下面是需要检测风险的文本：\n{text}\n\n"
-                f"请在参考以上政策/案例的前提下，重新给出风险等级，只输出 JSON："
+                f"以下是结构化路由上下文：\n{router_ctx_simplified}\n\n"
+                f"安全政策/条款/案例片段：\n{docs_text}\n\n"
+                f"待检测文本：\n{text}\n\n"
+                "请在参考政策的前提下，重新输出风险等级 JSON。"
             )
 
             risk_profile_2 = llm_chat_json(
@@ -460,38 +533,26 @@ def detect_risk_discrete(
                 temperature=0.0,
                 max_tokens=1024,
             )
+            profile_2 = _normalize_profile(risk_profile_2, router_ctx)
 
-            levels_2 = risk_profile_2.get("risk_levels") or {}
-            if not isinstance(levels_2, dict):
-                levels_2 = {}
-            for key in RISK_CATEGORIES:
-                levels_2[key] = _norm_level(levels_2.get(key, "NONE"))
-
-            raw_overall_2 = (risk_profile_2.get("overall_risk_level") or "L1").upper()
-            overall_2 = compute_overall_risk_level(levels_2, router_ctx)
-
-            risk_profile_2["risk_levels"] = levels_2
-            risk_profile_2["overall_risk_level_raw"] = raw_overall_2
-            risk_profile_2["overall_risk_level"] = overall_2
-
-            # 3) 保守合并：逐类取更高等级，再用规则重算整体等级
-            merged_levels = merge_risk_levels(levels_1, levels_2)
-            merged_overall = compute_overall_risk_level(merged_levels, router_ctx)
-
+            merged_levels = merge_risk_levels(levels_before_rag, profile_2["risk_levels"])
             final_profile = {
                 "risk_levels": merged_levels,
-                "overall_risk_level": merged_overall,
-                "overall_risk_level_raw": raw_overall_2,
+                "overall_risk_level": compute_overall_risk_level(merged_levels, router_ctx),
+                "overall_risk_level_raw": profile_2["overall_risk_level_raw"],
             }
             used_rag = True
-            stage2_profile = risk_profile_2
+            stage2_profile = profile_2
 
     # 附加 debug 信息（不会影响评估脚本对 risk_levels / overall 的使用）
     final_profile["debug"] = {
-        "stage1": {
-            "risk_levels": levels_1,
-            "overall_risk_level": overall_1,
-            "overall_risk_level_raw": raw_overall_1,
+        "stage1": profile_1,
+        "multi_view": {
+            "enabled": _env_flag("GUARD_MULTI_VIEW_ENABLED", "1"),
+            "used": used_multi_view,
+            "disagreement_count": disagreement_count,
+            "uncertainty_ratio": round(disagreement_count / max(len(RISK_CATEGORIES), 1), 4),
+            "stage": multi_view_profile,
         },
         "stage2": stage2_profile,
         "used_rag": used_rag,
