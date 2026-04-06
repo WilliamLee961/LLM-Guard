@@ -1,5 +1,5 @@
 # routing_hub.py
-from typing import Dict, Any
+from typing import Dict, Any, List
 from llm_client import llm_chat_json
 
 
@@ -294,15 +294,157 @@ def detect_language(text: str) -> Dict[str, Any]:
     }
 
 
+FAST_ROUTER_SYSTEM_PROMPT = """
+你是一个“在线安全路由快分类器”。
+目标是用一次分类同时输出以下字段，用于低时延在线链路：
+- lang
+- intent
+- attack_intent
+- domain
+- sentiment
+- entities
+- sensitive_slots
+
+要求：
+1. 只输出一个 JSON 对象，不要解释。
+2. 当信息不充分时，优先输出保守但不过度拦截的结果。
+3. domain 可以多选；若不确定，输出 ["general"]。
+4. entities 只保留最关键的实体，最多 5 个。
+5. sensitive_slots 若无明显敏感槽位，输出 ["NONE"]。
+
+可选标签：
+- lang: zh / en / mixed / other
+- intent: NORMAL_INFO / NORMAL_INSTRUCTION / SAFETY_DISCUSSION / MALICIOUS_GOAL / SELF_HARM_INTENT / MENTAL_HEALTH_HELP / ATTACK_MODEL / ROLE_PLAY / OTHER
+- attack_intent: NONE / JAILBREAK / PROMPT_INJECTION / PROMPT_LEAKING / REVERSE_EXPOSURE / OTHER_ATTACK
+- domain: general / physical_harm / self_harm / mental_health / crimes_illegal / malicious_use / privacy_property / sexual_content / insult_toxicity / discrimination / political / misinformation / financial_risk / fraud_deception / attack_model / role_play / ethics_morality / variant_words / other_risk
+- sentiment: NEUTRAL / HAPPY / ANGRY / SAD / DEPRESSED / SUICIDAL_IDEATION
+- entity type: PERSON / LOCATION / ORG / DRUG / WEAPON / PII_ID / PII_PHONE / PII_EMAIL / ACCOUNT / OTHER
+- sensitive_slots: DRUG / WEAPON / SELF_HARM / TERRORISM / PII / FINANCIAL / NONE
+
+输出格式：
+{
+  "lang": "zh",
+  "intent": "NORMAL_INFO",
+  "attack_intent": "NONE",
+  "domain": ["general"],
+  "sentiment": "NEUTRAL",
+  "entities": [{"text": "...", "type": "OTHER"}],
+  "sensitive_slots": ["NONE"]
+}
+"""
+
+_VALID_LANGS = {"zh", "en", "mixed", "other"}
+_VALID_INTENTS = {
+    "NORMAL_INFO",
+    "NORMAL_INSTRUCTION",
+    "SAFETY_DISCUSSION",
+    "MALICIOUS_GOAL",
+    "SELF_HARM_INTENT",
+    "MENTAL_HEALTH_HELP",
+    "ATTACK_MODEL",
+    "ROLE_PLAY",
+    "OTHER",
+}
+_VALID_ATTACK_INTENTS = {
+    "NONE",
+    "JAILBREAK",
+    "PROMPT_INJECTION",
+    "PROMPT_LEAKING",
+    "REVERSE_EXPOSURE",
+    "OTHER_ATTACK",
+}
+_VALID_SENTIMENTS = {
+    "NEUTRAL",
+    "HAPPY",
+    "ANGRY",
+    "SAD",
+    "DEPRESSED",
+    "SUICIDAL_IDEATION",
+}
+
+
+def _normalize_entities(entities: Any) -> List[Dict[str, Any]]:
+    if not isinstance(entities, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in entities[:5]:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        entity_type = str(item.get("type", "OTHER")).strip().upper() or "OTHER"
+        if not text:
+            continue
+        normalized.append({"text": text, "type": entity_type})
+    return normalized
+
+
+def _normalize_router_ctx(raw: Dict[str, Any], default_lang: str = "zh") -> Dict[str, Any]:
+    lang = str(raw.get("lang", default_lang)).strip().lower()
+    if lang not in _VALID_LANGS:
+        lang = default_lang
+
+    intent = str(raw.get("intent", "OTHER")).strip().upper()
+    if intent not in _VALID_INTENTS:
+        intent = "OTHER"
+
+    attack_intent = str(raw.get("attack_intent", "NONE")).strip().upper()
+    if attack_intent not in _VALID_ATTACK_INTENTS:
+        attack_intent = "NONE"
+
+    sentiment = str(raw.get("sentiment", "NEUTRAL")).strip().upper()
+    if sentiment not in _VALID_SENTIMENTS:
+        sentiment = "NEUTRAL"
+
+    domain = raw.get("domain") or ["general"]
+    if not isinstance(domain, list):
+        domain = ["general"]
+    domain = [str(item).strip() for item in domain if str(item).strip()]
+    if not domain:
+        domain = ["general"]
+
+    sensitive_slots = raw.get("sensitive_slots") or ["NONE"]
+    if not isinstance(sensitive_slots, list):
+        sensitive_slots = ["NONE"]
+    sensitive_slots = [str(item).strip().upper() for item in sensitive_slots if str(item).strip()]
+    if not sensitive_slots:
+        sensitive_slots = ["NONE"]
+
+    return {
+        "lang": lang,
+        "intent": intent,
+        "attack_intent": attack_intent,
+        "domain": domain,
+        "sentiment": sentiment,
+        "entities": _normalize_entities(raw.get("entities")),
+        "sensitive_slots": sensitive_slots,
+    }
+
+
+def analyze_query_fast(text: str) -> Dict[str, Any]:
+    user_prompt = f"用户输入如下：\n{text}\n\n请一次性完成快分类，只输出 JSON："
+    resp = llm_chat_json(
+        system_prompt=FAST_ROUTER_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        temperature=0.0,
+        max_tokens=1024,
+    )
+    return _normalize_router_ctx(resp or {})
+
+
 # =========================
 # 7. 汇总：围栏路由中枢主入口
 # =========================
 
-def analyze_query(text: str) -> Dict[str, Any]:
+def analyze_query(text: str, mode: str = "accurate") -> Dict[str, Any]:
     """
     围栏路由中枢主函数：
     按顺序调用各子模块，将结果合并成统一的 router_ctx。
     """
+    runtime_mode = (mode or "accurate").strip().lower()
+    if runtime_mode == "fast":
+        return analyze_query_fast(text)
+
     # 1. 语言识别
     lang_info = detect_language(text)
 
@@ -331,7 +473,7 @@ def analyze_query(text: str) -> Dict[str, Any]:
         "sensitive_slots": entity_info.get("sensitive_slots", ["NONE"]),
     }
 
-    return router_ctx
+    return _normalize_router_ctx(router_ctx, default_lang=str(lang_info.get("lang", "zh")))
 
 
 if __name__ == "__main__":

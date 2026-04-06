@@ -24,7 +24,13 @@ class SafetyGuard:
     3. 集成安全代答 (SafeQA)，当检测到违规时自动重写内容。
     """
 
-    def __init__(self, detect_mode: str = "normal", use_rag: bool = False, enabled: bool = True):
+    def __init__(
+        self,
+        detect_mode: str = "normal",
+        use_rag: bool = False,
+        enabled: bool = True,
+        runtime_mode: str = "accurate",
+    ):
         """
         初始化安全围栏。
 
@@ -42,11 +48,18 @@ class SafetyGuard:
         self.detect_mode = detect_mode
         self.use_rag = use_rag
         self.enabled = enabled
-        
+        self.runtime_mode = runtime_mode
+
         # 初始化检测图（只负责判断是否违规，不负责重写）
-        self.detect_graph = build_guard_graph(detection_difficulty=detect_mode)
-        
-        print(f"[SafetyGuard] 初始化完成 | 模式: {detect_mode} | RAG: {use_rag} | 开关: {'开启' if enabled else '关闭'}")
+        self.detect_graph = build_guard_graph(
+            detection_difficulty=detect_mode,
+            runtime_mode=runtime_mode,
+        )
+
+        print(
+            f"[SafetyGuard] 初始化完成 | 检测: {detect_mode} | 运行: {runtime_mode} | "
+            f"RAG: {use_rag} | 开关: {'开启' if enabled else '关闭'}"
+        )
 
     def check_input(self, question: str) -> Tuple[bool, str, Dict[str, Any]]:
         """
@@ -175,18 +188,19 @@ class SafetyGuard:
         """
         try:
             # 1. 分析意图（SafeQA 需要知道用户想干嘛）
-            router_ctx_in = analyze_query(question)
+            router_ctx_in = analyze_query(question, mode=self.runtime_mode)
             
             # 如果是检查输出，最好也分析一下原来的回答（可选）
             router_ctx_out = {}
             if source_type == "output" and unsafe_response:
-                router_ctx_out = analyze_query(unsafe_response)
+                router_ctx_out = analyze_query(unsafe_response, mode=self.runtime_mode)
 
             # 2. 构造 SafeQA 的输入状态
             # 这里复用了 safe_qa_graph 中的 QAState 定义
             state: QAState = {
                 "user_query": question,
                 "difficulty": self.detect_mode,
+                "runtime_mode": self.runtime_mode,
                 "model_answer": unsafe_response, # 如果是 Input Guard，这里是空的
                 
                 "router_ctx_in": router_ctx_in,
@@ -216,8 +230,12 @@ class SafetyGuard:
                 difficulty=self.detect_mode,
                 input_risk_profile=input_risk_profile or {},
                 output_risk_profile=output_risk_profile or {},
-                router_ctx_in=analyze_query(question),
-                router_ctx_out=analyze_query(unsafe_response) if unsafe_response else {},
+                router_ctx_in=analyze_query(question, mode=self.runtime_mode),
+                router_ctx_out=(
+                    analyze_query(unsafe_response, mode=self.runtime_mode)
+                    if unsafe_response
+                    else {}
+                ),
             )
             risk_profile = output_risk_profile if source_type == "output" else input_risk_profile
             fallback = render_fallback_safe_response(

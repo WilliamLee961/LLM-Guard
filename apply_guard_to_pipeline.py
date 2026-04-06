@@ -65,6 +65,18 @@ def parse_args():
     parser.add_argument("--output_detect_mode", type=str, default=None,
                         choices=["lenient", "normal", "strict"],
                         help="Output Guard 的严格程度 (默认跟随 detect_mode)")
+
+    parser.add_argument("--runtime_mode", type=str, default="accurate",
+                        choices=["accurate", "fast"],
+                        help="运行时模式: accurate 保留完整链路, fast 使用在线低时延链路")
+
+    parser.add_argument("--input_runtime_mode", type=str, default=None,
+                        choices=["accurate", "fast"],
+                        help="Input Guard 的运行时模式 (默认跟随 runtime_mode)")
+
+    parser.add_argument("--output_runtime_mode", type=str, default=None,
+                        choices=["accurate", "fast"],
+                        help="Output Guard 的运行时模式 (默认跟随 runtime_mode)")
     
     # 开关控制
     parser.add_argument("--enable_input_guard", action="store_true", default=True)
@@ -228,6 +240,8 @@ def main():
     # 如果没单独指定 input/output mode，就用全局的 detect_mode
     in_mode = args.input_detect_mode if args.input_detect_mode else args.detect_mode
     out_mode = args.output_detect_mode if args.output_detect_mode else args.detect_mode
+    in_runtime_mode = args.input_runtime_mode if args.input_runtime_mode else args.runtime_mode
+    out_runtime_mode = args.output_runtime_mode if args.output_runtime_mode else args.runtime_mode
 
     # --- 2. 动态生成文件名 ---
     if args.output_path is None:
@@ -241,14 +255,22 @@ def main():
         file_out_mode = out_mode if args.enable_output_guard else "None"
         
 
-        mode_str = f"in_{file_in_mode}_out_{file_out_mode}_rag_{args.use_rag}"
+        mode_str = (
+            f"in_{file_in_mode}_{in_runtime_mode}_"
+            f"out_{file_out_mode}_{out_runtime_mode}_rag_{args.use_rag}"
+        )
             
         filename = f"Guard_FullPipeline_{mode_str}_{timestamp}.jsonl"
         args.output_path = os.path.join(base_dir, filename)
         print(f"[Info] 自动生成输出路径: {args.output_path}")
 
     # --- 3. 初始化 Guard 实例 ---
-    print(f"Initializing SafetyGuards (Input Mode: {in_mode}, Output Mode: {out_mode}, RAG: {args.use_rag})...")
+    print(
+        "Initializing SafetyGuards "
+        f"(Input Detect: {in_mode}, Input Runtime: {in_runtime_mode}, "
+        f"Output Detect: {out_mode}, Output Runtime: {out_runtime_mode}, "
+        f"RAG: {args.use_rag})..."
+    )
     
     input_guard = None
     output_guard = None
@@ -256,20 +278,42 @@ def main():
     # 优化资源：如果模式相同，只实例化一个 Guard 对象复用
     # 注意：这里依然使用 in_mode/out_mode 来初始化对象，即使该 Guard 可能被禁用。
     # 禁用逻辑在 process_line 中通过 enable_input/output 开关控制。
-    if in_mode == out_mode:
-        print(f"Modes are identical ({in_mode}). Sharing single SafetyGuard instance.")
-        shared_guard = SafetyGuard(detect_mode=in_mode, use_rag=args.use_rag, enabled=True)
+    if in_mode == out_mode and in_runtime_mode == out_runtime_mode:
+        print(
+            f"Modes are identical (detect={in_mode}, runtime={in_runtime_mode}). "
+            "Sharing single SafetyGuard instance."
+        )
+        shared_guard = SafetyGuard(
+            detect_mode=in_mode,
+            use_rag=args.use_rag,
+            enabled=True,
+            runtime_mode=in_runtime_mode,
+        )
         input_guard = shared_guard
         output_guard = shared_guard
     else:
         print(f"Modes differ. Creating separate SafetyGuard instances.")
-        print(f"  -> Creating Input Guard ({in_mode})...")
-        input_guard = SafetyGuard(detect_mode=in_mode, use_rag=args.use_rag, enabled=True)
+        print(f"  -> Creating Input Guard (detect={in_mode}, runtime={in_runtime_mode})...")
+        input_guard = SafetyGuard(
+            detect_mode=in_mode,
+            use_rag=args.use_rag,
+            enabled=True,
+            runtime_mode=in_runtime_mode,
+        )
         
-        print(f"  -> Creating Output Guard ({out_mode})...")
-        output_guard = SafetyGuard(detect_mode=out_mode, use_rag=args.use_rag, enabled=True)
+        print(f"  -> Creating Output Guard (detect={out_mode}, runtime={out_runtime_mode})...")
+        output_guard = SafetyGuard(
+            detect_mode=out_mode,
+            use_rag=args.use_rag,
+            enabled=True,
+            runtime_mode=out_runtime_mode,
+        )
     
-    print(f"Pipeline Config: InputGuard={args.enable_input_guard} [{in_mode}], OutputGuard={args.enable_output_guard} [{out_mode}]")
+    print(
+        "Pipeline Config: "
+        f"InputGuard={args.enable_input_guard} [detect={in_mode}, runtime={in_runtime_mode}], "
+        f"OutputGuard={args.enable_output_guard} [detect={out_mode}, runtime={out_runtime_mode}]"
+    )
     print(f"Processing data from: {args.jsonl_path}")
 
     lines = []

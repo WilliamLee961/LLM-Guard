@@ -19,6 +19,7 @@ class GuardState(TypedDict, total=False):
     router_ctx: Dict[str, Any]
     risk_profile: Dict[str, Any]
     pred_violation: int
+    runtime_mode: str
 
 
 # =========================
@@ -154,19 +155,23 @@ def is_predicted_violation(
 # 各个节点（Node）函数
 # =========================
 
-def route_node(state: GuardState) -> GuardState:
-    """
-    围栏路由节点：
-      输入：state["text"]
-      输出：state["router_ctx"]
-    """
-    text = state.get("text", "")
-    router_ctx = analyze_query(text)
-    state["router_ctx"] = router_ctx
-    return state
+def route_node_factory(runtime_mode: str = "accurate"):
+    def route_node(state: GuardState) -> GuardState:
+        """
+        围栏路由节点：
+          输入：state["text"]
+          输出：state["router_ctx"]
+        """
+        text = state.get("text", "")
+        router_ctx = analyze_query(text, mode=runtime_mode)
+        state["router_ctx"] = router_ctx
+        state["runtime_mode"] = runtime_mode
+        return state
+
+    return route_node
 
 
-def risk_node_factory(difficulty: str = "normal"):
+def risk_node_factory(difficulty: str = "normal", runtime_mode: str = "accurate"):
     """
     工厂函数，返回真正的 risk_node，
     这样我们可以把 detection difficulty 作为配置注入。
@@ -181,7 +186,12 @@ def risk_node_factory(difficulty: str = "normal"):
         text = state.get("text", "")
         router_ctx = state.get("router_ctx") or {}
 
-        risk_profile = detect_risk_discrete(text, router_ctx, mode="input")
+        risk_profile = detect_risk_discrete(
+            text,
+            router_ctx,
+            mode="input",
+            runtime_mode=runtime_mode,
+        )
         state["risk_profile"] = risk_profile
 
         pred = is_predicted_violation(risk_profile, mode=difficulty)
@@ -196,7 +206,7 @@ def risk_node_factory(difficulty: str = "normal"):
 # 构建 LangGraph 工作流
 # =========================
 
-def build_guard_graph(detection_difficulty: str = "normal"):
+def build_guard_graph(detection_difficulty: str = "normal", runtime_mode: str = "accurate"):
     """
     构建一个两节点的 LangGraph：
       entry: route  →  risk  →  END
@@ -208,8 +218,11 @@ def build_guard_graph(detection_difficulty: str = "normal"):
     workflow = StateGraph(GuardState)
 
     # 添加节点
-    workflow.add_node("route", route_node)
-    workflow.add_node("risk", risk_node_factory(difficulty=detection_difficulty))
+    workflow.add_node("route", route_node_factory(runtime_mode=runtime_mode))
+    workflow.add_node(
+        "risk",
+        risk_node_factory(difficulty=detection_difficulty, runtime_mode=runtime_mode),
+    )
 
     # 指定入口节点
     workflow.set_entry_point("route")

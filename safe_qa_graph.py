@@ -32,6 +32,7 @@ class QAState(TypedDict, total=False):
     """
     user_query: str
     difficulty: str
+    runtime_mode: str
 
     router_ctx_in: Dict[str, Any]
     input_risk_profile: Dict[str, Any]
@@ -48,6 +49,13 @@ class QAState(TypedDict, total=False):
     guard_stage: str
     response_strategy: Dict[str, Any]
     rewritten_user_query: str
+
+
+def _get_runtime_mode(state: QAState) -> str:
+    runtime_mode = str(state.get("runtime_mode", "accurate")).strip().lower()
+    if runtime_mode not in {"accurate", "fast"}:
+        return "accurate"
+    return runtime_mode
 
 
 # =========================
@@ -124,12 +132,12 @@ def route_input_node(state: QAState) -> QAState:
     输入侧：围栏路由
     """
     q = state.get("user_query", "")
-    router_ctx = analyze_query(q)
+    router_ctx = analyze_query(q, mode=_get_runtime_mode(state))
     state["router_ctx_in"] = router_ctx
     return state
 
 
-def risk_input_node_factory(difficulty: str = "normal"):
+def risk_input_node_factory(difficulty: str = "normal", runtime_mode: str = "accurate"):
 
     def risk_input_node(state: QAState) -> QAState:
         q = state.get("user_query", "")
@@ -139,7 +147,7 @@ def risk_input_node_factory(difficulty: str = "normal"):
             q,
             router_ctx,
             mode="input",
-            use_rag_on_uncertain=True,
+            runtime_mode=runtime_mode,
         )
         state["input_risk_profile"] = risk_profile
 
@@ -198,12 +206,12 @@ def route_output_node(state: QAState) -> QAState:
     输出侧：对模型的回答再做一次路由分析。
     """
     ans = state.get("model_answer", "") or ""
-    router_ctx = analyze_query(ans)
+    router_ctx = analyze_query(ans, mode=_get_runtime_mode(state))
     state["router_ctx_out"] = router_ctx
     return state
 
 
-def risk_output_node_factory(difficulty: str = "normal"):
+def risk_output_node_factory(difficulty: str = "normal", runtime_mode: str = "accurate"):
 
     def risk_output_node(state: QAState) -> QAState:
         ans = state.get("model_answer", "") or ""
@@ -213,7 +221,7 @@ def risk_output_node_factory(difficulty: str = "normal"):
             ans,
             router_ctx,
             mode="output",
-            use_rag_on_uncertain=True,
+            runtime_mode=runtime_mode,
         )
         state["output_risk_profile"] = risk_profile
 
@@ -405,6 +413,12 @@ def input_route_fn(state: QAState) -> str:
         return "main_answer"
 
 
+def main_answer_route_fn(state: QAState) -> str:
+    if _get_runtime_mode(state) == "fast":
+        return "finalize_answer"
+    return "route_output"
+
+
 def output_route_fn(state: QAState) -> str:
     strategy = state.get("response_strategy") or {}
     action = str(strategy.get("action", "ALLOW")).upper()
@@ -418,17 +432,23 @@ def output_route_fn(state: QAState) -> str:
 # 构建安全 QA LangGraph
 # =========================
 
-def build_safe_qa_graph(detection_difficulty: str = "normal"):
+def build_safe_qa_graph(detection_difficulty: str = "normal", runtime_mode: str = "accurate"):
     workflow = StateGraph(QAState)
 
     workflow.add_node("route_input", route_input_node)
-    workflow.add_node("risk_input", risk_input_node_factory(detection_difficulty))
+    workflow.add_node(
+        "risk_input",
+        risk_input_node_factory(detection_difficulty, runtime_mode=runtime_mode),
+    )
     workflow.add_node("input_decision", input_decision_node)
 
     workflow.add_node("safe_answer", safe_answer_node)
     workflow.add_node("main_answer", main_answer_node)
     workflow.add_node("route_output", route_output_node)
-    workflow.add_node("risk_output", risk_output_node_factory(detection_difficulty))
+    workflow.add_node(
+        "risk_output",
+        risk_output_node_factory(detection_difficulty, runtime_mode=runtime_mode),
+    )
     workflow.add_node("output_decision", output_decision_node)
     workflow.add_node("finalize_answer", finalize_answer_node)
 
@@ -446,7 +466,14 @@ def build_safe_qa_graph(detection_difficulty: str = "normal"):
         },
     )
 
-    workflow.add_edge("main_answer", "route_output")
+    workflow.add_conditional_edges(
+        "main_answer",
+        main_answer_route_fn,
+        {
+            "route_output": "route_output",
+            "finalize_answer": "finalize_answer",
+        },
+    )
     workflow.add_edge("route_output", "risk_output")
     workflow.add_edge("risk_output", "output_decision")
 

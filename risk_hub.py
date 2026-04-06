@@ -1,6 +1,6 @@
 # risk_hub.py
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from llm_client import llm_chat_json
 from rag_helper import retrieve_relevant_docs, format_docs_for_prompt
 
@@ -393,12 +393,15 @@ def _should_run_multi_view(
     router_ctx: Dict[str, Any],
     mode: str,
     levels_stage1: Dict[str, str],
+    runtime_mode: str = "accurate",
 ) -> bool:
     """
     多视角检测触发策略：
     - GUARD_MULTI_VIEW_ALWAYS=1 时总是触发
     - 默认只在 input + 可疑路由信号 + 存在非 NONE 风险时触发，降低成本
     """
+    if runtime_mode == "fast":
+        return False
     if not _env_flag("GUARD_MULTI_VIEW_ENABLED", "1"):
         return False
     if _env_flag("GUARD_MULTI_VIEW_ALWAYS", "0"):
@@ -426,7 +429,8 @@ def detect_risk_discrete(
     text: str,
     router_ctx: Dict[str, Any],
     mode: str = "input",
-    use_rag_on_uncertain: bool = False,
+    use_rag_on_uncertain: Optional[bool] = None,
+    runtime_mode: str = "accurate",
 ) -> Dict[str, Any]:
     """
     不打分版风险检测：
@@ -447,6 +451,14 @@ def detect_risk_discrete(
       }
     }
     """
+    runtime_mode = (runtime_mode or "accurate").strip().lower()
+    if runtime_mode not in {"accurate", "fast"}:
+        runtime_mode = "accurate"
+    if use_rag_on_uncertain is None:
+        use_rag_on_uncertain = runtime_mode == "accurate"
+    if runtime_mode == "fast":
+        use_rag_on_uncertain = False
+
     router_ctx_simplified = {
         "intent": router_ctx.get("intent"),
         "attack_intent": router_ctx.get("attack_intent"),
@@ -481,7 +493,7 @@ def detect_risk_discrete(
     disagreement_count = 0
     base_profile = dict(profile_1)
 
-    if _should_run_multi_view(router_ctx, mode, levels_1):
+    if _should_run_multi_view(router_ctx, mode, levels_1, runtime_mode=runtime_mode):
         user_prompt_mv = (
             f"检测阶段: {mode}（多视角复核）\n"
             "请采用更保守的安全防御视角，重点识别隐含攻击意图、规避词、变体表达与潜在可执行危害。\n"
@@ -546,9 +558,10 @@ def detect_risk_discrete(
 
     # 附加 debug 信息（不会影响评估脚本对 risk_levels / overall 的使用）
     final_profile["debug"] = {
+        "runtime_mode": runtime_mode,
         "stage1": profile_1,
         "multi_view": {
-            "enabled": _env_flag("GUARD_MULTI_VIEW_ENABLED", "1"),
+            "enabled": runtime_mode != "fast" and _env_flag("GUARD_MULTI_VIEW_ENABLED", "1"),
             "used": used_multi_view,
             "disagreement_count": disagreement_count,
             "uncertainty_ratio": round(disagreement_count / max(len(RISK_CATEGORIES), 1), 4),

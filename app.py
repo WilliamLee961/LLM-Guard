@@ -19,10 +19,14 @@ from safe_qa_graph import build_safe_qa_graph, QAState
 # =========================conda --version
 
 # 默认用 normal 难度，你可以在这里改成 strict / lenient
-_guard_app = build_guard_graph(detection_difficulty="normal")
+_guard_app = build_guard_graph(detection_difficulty="normal", runtime_mode="accurate")
 
 
-def run_guardrails(text: str, difficulty: str = "normal") -> Dict[str, Any]:
+def run_guardrails(
+    text: str,
+    difficulty: str = "normal",
+    runtime_mode: str = "accurate",
+) -> Dict[str, Any]:
     """
     纯“侧载式安全检测”调用入口。
 
@@ -39,7 +43,10 @@ def run_guardrails(text: str, difficulty: str = "normal") -> Dict[str, Any]:
     """
     # 如果你希望动态调整 difficulty，可以在这里根据参数重建 graph；
     # 为了简单，这里直接用 difficulty 传进 is_predicted_violation 的配置版 guard_graph。
-    guard_app = build_guard_graph(detection_difficulty=difficulty)
+    guard_app = build_guard_graph(
+        detection_difficulty=difficulty,
+        runtime_mode=runtime_mode,
+    )
 
     state: GuardState = {"text": text}
     result: GuardState = guard_app.invoke(state)
@@ -55,10 +62,14 @@ def run_guardrails(text: str, difficulty: str = "normal") -> Dict[str, Any]:
 # 2) 完整安全问答模式
 # =========================
 
-_safe_qa_app = build_safe_qa_graph(detection_difficulty="normal")
+_safe_qa_app = build_safe_qa_graph(detection_difficulty="normal", runtime_mode="accurate")
 
 
-def run_safe_qa(user_query: str, difficulty: str = "normal") -> Dict[str, Any]:
+def run_safe_qa(
+    user_query: str,
+    difficulty: str = "normal",
+    runtime_mode: str = "accurate",
+) -> Dict[str, Any]:
     """
     完整安全问答入口（输入/输出双向检测 + RAG + 安全代答/重写）。
 
@@ -79,11 +90,15 @@ def run_safe_qa(user_query: str, difficulty: str = "normal") -> Dict[str, Any]:
         "final_answer": "..."           # 最终给用户的安全回答
       }
     """
-    safe_app = build_safe_qa_graph(detection_difficulty=difficulty)
+    safe_app = build_safe_qa_graph(
+        detection_difficulty=difficulty,
+        runtime_mode=runtime_mode,
+    )
 
     init_state: QAState = {
         "user_query": user_query,
         "difficulty": difficulty,
+        "runtime_mode": runtime_mode,
     }
 
     result: QAState = safe_app.invoke(init_state)
